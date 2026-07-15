@@ -1,0 +1,73 @@
+# Classification Evidence Weights v1.0.0
+# This file is externally configured and version controlled.
+# NEVER modify in place — create a new version for any weight changes.
+
+version: "1.0.0"
+created_date: "2025-01-01T00:00:00"
+calibration_dataset_version: "initial"
+description: "Initial evidence weights for classification framework"
+
+aggregation_method: "weighted_sum"
+
+# Ramp classifier evidence weights
+ramp_weights:
+  sustained_positive_slope: 0.15
+  sustained_negative_slope: 0.15
+  dwell_departure_confidence: 0.10
+  dwell_arrival_confidence: 0.10
+  monotonicity_score: 0.10
+  slope_magnitude: 0.08
+  overshoot_characteristics: 0.05
+  stability_score: 0.05
+  duration_adequacy: 0.07
+  reversal_tolerance: 0.03
+  boundary_stability_score: 0.04
+  transition_persistence_score: 0.03
+  arrival_certainty_score: 0.02
+  departure_certainty_score: 0.02
+  local_gap_resilience_score: 0.01
+
+# Dwell classifier evidence weights
+dwell_weights:
+  temperature_stability: 0.20
+  setpoint_proximity: 0.20
+  duration_adequacy: 0.15
+  tolerance_band_persistence: 0.15
+  cluster_membership: 0.10
+  boundary_confidence: 0.05
+  variance_score: 0.10
+  directionality_absence: 0.05
+
+# Overshoot classifier evidence weights
+overshoot_weights:
+  peak_magnitude: 0.25
+  overshoot_direction: 0.15
+  return_confidence: 0.15
+  duration_adequacy: 0.10
+  boundary_confidence: 0.10
+  oscillation_pattern: 0.15
+  settling_characteristics: 0.10
+
+# Correction classifier evidence weights
+correction_weights:
+  return_direction: 0.20
+  oscillation_count: 0.20
+  amplitude_decay: 0.15
+  settling_confidence: 0.15
+  boundary_confidence: 0.15
+  duration_adequacy: 0.15
+
+# Transient classifier evidence weights
+transient_weights:
+  short_duration: 0.30
+  low_slope_magnitude: 0.20
+  high_variance: 0.20
+  boundary_ambiguity: 0.15
+  lack_of_pattern: 0.15
+
+# Unknown classifier evidence weights
+unknown_weights:
+  low_all_scores: 0.30
+  conflicting_signals: 0.30
+  data_quality_issues: 0.20
+  outlier_characteristics: 0.20

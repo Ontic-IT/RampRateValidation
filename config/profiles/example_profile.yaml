@@ -1,0 +1,101 @@
+# Example Validation Profile
+# This file demonstrates the 12 required sub-objects for ValidationProfile.
+
+profile_metadata:
+  profile_name: "Example Thermal Cycling Profile"
+  profile_version: "1.0.0"
+  created_date: "2025-01-01T00:00:00"
+  description: "Standard thermal cycling profile for validation testing"
+  algorithm_version_required: "1.0.0"
+
+expected_process_sequence:
+  first_extreme: "HOT_FIRST"  # Descriptive - report what was found
+  expected_end_condition: "RETURN_TO_AMBIENT"  # Descriptive - report what was found
+  expected_region_sequence:  # Descriptive - report actual sequence classified
+    - "AMBIENT_START"
+    - "HEATING_RAMP"
+    - "HOT_DWELL"
+    - "COOLING_RAMP"
+    - "COLD_DWELL"
+  hot_cycle_count_min: 0  # Report measured cycle count
+  hot_cycle_count_max: 999  # Report measured cycle count
+
+ramp_rate_requirements:
+  required_heating_ramp_rate_c_per_min: 0.0  # Report measured heating ramp rate
+  required_cooling_ramp_rate_c_per_min: 0.0  # Report measured cooling ramp rate
+  minimum_sustained_ramp_rate_ratio: 0.0  # Report measured sustained ratio
+  sustained_ramp_window_seconds: 60.0
+  minimum_valid_ramp_duration_seconds: 0.0  # Report measured ramp duration
+  allowed_ramp_deviation_c: null  # Adaptive tolerance from data
+  tolerance_source: "ADAPTIVE"
+
+dwell_requirements:
+  minimum_hot_dwell_seconds: 30.0  # Minimum dwell duration for validation
+  minimum_cold_dwell_seconds: 30.0  # Minimum dwell duration for validation
+  allowed_setpoint_deviation_c: null  # Adaptive tolerance from data (2x stable variance)
+  dwell_stability_window_seconds: 30.0
+  tolerance_source: "ADAPTIVE"
+
+setpoint_deviation_requirements:
+  allowed_setpoint_deviation_c: null  # Use adaptive tolerance (2x stable variance)
+  setpoint_deviation_warning_c: null  # Use adaptive tolerance
+
+overshoot_requirements:
+  overshoot_warning_threshold_c: 0.0  # Report measured overshoot magnitude
+  overshoot_failure_threshold_c: 0.0  # Report measured overshoot magnitude
+  max_overshoot_duration_seconds: 0.0  # Report measured overshoot duration
+
+settling_requirements:
+  settling_time_limit_seconds: 0.0  # Report measured settling time
+  settling_tolerance_band_c: 0.0  # Report measured settling band
+
+data_quality_requirements:
+  max_missing_data_pct: 5.0
+  max_duplicate_timestamp_pct: 1.0
+  max_gap_seconds: 30.0
+  min_process_duration_seconds: 60.0
+  max_spike_count: 10
+
+classification_settings:
+  slope_threshold_min_c_per_min: 0.1
+  slope_threshold_max_c_per_min: 50.0
+  MAD_threshold_min_c: 0.01
+  MAD_threshold_max_c: 10.0
+  min_region_duration_seconds: 5.0
+  secondary_classification_threshold: 0.5
+  ambiguity_margin_threshold: 0.1
+  high_confidence_threshold: 0.8
+  medium_confidence_threshold: 0.6
+  ambiguity_handling: "WARN"
+
+cycle_rules:
+  allow_partial_cycle_validation: false
+  minimum_complete_cycles_required: 1
+  cycle_sequence_strict: true
+
+visualisation_settings:
+  show_analysis_signal: true
+  region_colour_map:
+    HEATING_RAMP: "#FF8C00"
+    COOLING_RAMP: "#4169E1"
+    HOT_DWELL: "#228B22"
+    COLD_DWELL: "#32CD32"
+    AMBIENT_START: "#808080"
+    HOT_OVERSHOOT: "#DC143C"
+    COLD_OVERSHOOT: "#0000CD"
+    HOT_CORRECTION: "#FF6347"
+    COLD_CORRECTION: "#4682B4"
+    RECOVERY: "#9370DB"
+    TRANSIENT: "#DAA520"
+    UNKNOWN: "#696969"
+  annotation_font_size: 10
+  export_format: "html"
+
+reporting_settings:
+  include_audit_trail: true
+  include_algorithm_appendix: true
+  export_pdf: true
+  export_excel: true
+  report_title: "Ramp Rate Validation Report"
+
+tolerance_resolutions: []
