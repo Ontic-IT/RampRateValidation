@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Classification Reference Trace Expected Output",
+  "description": "Schema for expected classification outputs used in calibration and Gate 3 acceptance testing",
+  "type": "object",
+  "required": [
+    "trace_id",
+    "trace_type",
+    "description",
+    "expected_primary_classifications",
+    "expected_secondary_classifications",
+    "expected_classification_scores",
+    "expected_margins",
+    "expected_ambiguity_flags",
+    "score_tolerance",
+    "margin_tolerance"
+  ],
+  "properties": {
+    "trace_id": {
+      "type": "string",
+      "description": "Unique identifier for the trace"
+    },
+    "trace_type": {
+      "type": "string",
+      "enum": ["synthetic", "real_world", "edge_case"],
+      "description": "Category of the trace"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of what this trace contains"
+    },
+    "expected_primary_classifications": {
+      "type": "object",
+      "description": "Map of region_id to expected primary RegionType classification",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "expected_secondary_classifications": {
+      "type": "object",
+      "description": "Map of region_id to expected secondary RegionType classifications",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "expected_classification_scores": {
+      "type": "object",
+      "description": "Map of region_id to expected classification scores per RegionType",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      }
+    },
+    "expected_margins": {
+      "type": "object",
+      "description": "Map of region_id to expected classification margin",
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0
+      }
+    },
+    "expected_ambiguity_flags": {
+      "type": "object",
+      "description": "Map of region_id to expected is_ambiguous flag",
+      "additionalProperties": {
+        "type": "boolean"
+      }
+    },
+    "score_tolerance": {
+      "type": "number",
+      "default": 0.05,
+      "description": "Maximum allowed drift in classification scores"
+    },
+    "margin_tolerance": {
+      "type": "number",
+      "default": 0.03,
+      "description": "Maximum allowed drift in classification margins"
+    }
+  }
+}

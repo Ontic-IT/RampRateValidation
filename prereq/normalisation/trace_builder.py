@@ -51,20 +51,68 @@ def build_canonical_trace(
     
     if raw_trace.row_count == 0:
         raise InputFormatError("Cannot normalise empty trace")
-    
-    time_col = find_time_column(raw_trace.columns)
-    if time_col is None:
-        time_col = raw_trace.columns[0]
-    
+
     temp_col = file_metadata.selected_temperature_channel
     sp_col = file_metadata.selected_setpoint_channel
-    
-    time_values = [str(row.get(time_col, "")) for row in raw_trace.data]
-    timestamps, ts_format = parse_timestamps(
-        time_values,
-        format_hint=file_metadata.detected_timestamp_format,
-    )
-    
+
+    if file_metadata.time_kind:
+        # Adaptive path: the loader already identified the time channel and
+        # how to decode it; apply evidence-based decoding (day-first
+        # resolution, locale-damage repair, relative-time anchoring).
+        import pandas as pd
+        from inputs.parsers import decode_time_series
+
+        time_col = file_metadata.selected_time_channel or raw_trace.columns[0]
+        values = pd.Series([row.get(time_col) for row in raw_trace.data])
+        pair_values = None
+        if file_metadata.selected_time_channel_pair:
+            _, t_col = file_metadata.selected_time_channel_pair
+            pair_values = pd.Series([row.get(t_col) for row in raw_trace.data])
+
+        filename_date = None
+        meta = file_metadata.preamble_metadata
+        for key, fmt in (("filename_date_ddmmyy", "%d%m%y"), ("filename_date_ddmmyyyy", "%d%m%Y")):
+            if key in meta:
+                try:
+                    filename_date = datetime.strptime(meta[key], fmt)
+                    break
+                except ValueError:
+                    pass
+
+        try:
+            timestamps, decode_notes = decode_time_series(
+                values,
+                kind=file_metadata.time_kind,
+                time_values=pair_values,
+                anchor=file_metadata.time_anchor,
+                filename_date=filename_date,
+            )
+        except (ValueError, TypeError) as e:
+            raise InputFormatError(f"Failed to decode time channel '{time_col}': {e}") from e
+
+        for note in decode_notes:
+            audit_log.add(AuditEntry(
+                timestamp=datetime.now(),
+                module_name="trace_builder",
+                action="time_decoding",
+                decision="INFO",
+                reason=note,
+                severity=AuditSeverity.INFO,
+                category=AuditCategory.PIPELINE,
+            ))
+    else:
+        # Legacy path: metadata built without channel assignment (e.g. by
+        # direct callers/tests) — behave exactly as before.
+        time_col = find_time_column(raw_trace.columns)
+        if time_col is None:
+            time_col = raw_trace.columns[0]
+
+        time_values = [str(row.get(time_col, "")) for row in raw_trace.data]
+        timestamps, ts_format = parse_timestamps(
+            time_values,
+            format_hint=file_metadata.detected_timestamp_format,
+        )
+
     if not timestamps:
         raise InputFormatError("Failed to parse any timestamps")
     
