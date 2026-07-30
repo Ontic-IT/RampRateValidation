@@ -61,18 +61,31 @@ def compute_dwell_metrics(
     temperatures = np.array([r.temperature_c_raw for r in rows])
     elapsed = np.array([r.elapsed_seconds for r in rows])
     
-    if region.primary_classification == RegionType.HOT_DWELL:
-        target_setpoint = setpoints.inferred_hot_setpoint_c
-    elif region.primary_classification == RegionType.COLD_DWELL:
-        target_setpoint = setpoints.inferred_cold_setpoint_c
+    # Mode A: when the trace carries the actual commanded setpoint, THAT is
+    # the target — conformance means "actual temperature vs commanded
+    # setpoint", compared SAMPLE BY SAMPLE so regions that straddle a
+    # setpoint change are judged against what was commanded at each instant.
+    # Inferred cluster levels are the Mode B fallback only.
+    per_sample = np.array([
+        (r.temperature_c_raw, r.setpoint_c) for r in rows if r.setpoint_c is not None
+    ], dtype=float)
+    if len(per_sample) >= max(2, len(rows) // 2):
+        target_setpoint = float(np.median(per_sample[:, 1]))
+        setpoint_deviation = float(np.mean(np.abs(per_sample[:, 0] - per_sample[:, 1])))
     else:
-        target_setpoint = setpoints.inferred_ambient_c
-    
+        if region.primary_classification == RegionType.HOT_DWELL:
+            target_setpoint = setpoints.inferred_hot_setpoint_c
+        elif region.primary_classification == RegionType.COLD_DWELL:
+            target_setpoint = setpoints.inferred_cold_setpoint_c
+        else:
+            target_setpoint = setpoints.inferred_ambient_c
+        setpoint_deviation = (
+            abs(float(np.mean(temperatures)) - target_setpoint) if target_setpoint else 0.0
+        )
+
     mean_temp = float(np.mean(temperatures))
     temp_std = float(np.std(temperatures))
     temp_range = float(np.max(temperatures) - np.min(temperatures))
-    
-    setpoint_deviation = abs(mean_temp - target_setpoint) if target_setpoint else 0.0
     
     effective_deviation = allowed_setpoint_deviation_c if allowed_setpoint_deviation_c is not None else 5.0
     
@@ -80,13 +93,16 @@ def compute_dwell_metrics(
         temperatures, elapsed, target_setpoint, effective_deviation
     )
     
-    overshoot_mag, overshoot_dur, settling_time = _compute_overshoot_metrics(
-        temperatures, elapsed, target_setpoint, settling_tolerance_band_c,
+    # Overshoot and oscillation are judged against the SETPOINT TOLERANCE
+    # (the adaptive dwell deviation the report exposes), not a fixed band, so
+    # "beyond tolerance" here means the same thing the reader sees and adjusts.
+    overshoot_mag, overshoot_dur, overshoot_recovery, settling_time = _compute_overshoot_metrics(
+        temperatures, elapsed, target_setpoint, effective_deviation,
         region.primary_classification
     )
-    
+
     oscillation_count = _compute_oscillation_count(
-        temperatures, target_setpoint, settling_tolerance_band_c
+        temperatures, target_setpoint, effective_deviation
     )
     
     stability_score = _compute_stability_score(temp_std, temp_range, settling_tolerance_band_c)
@@ -102,6 +118,7 @@ def compute_dwell_metrics(
         time_inside_tolerance_band_pct=time_in_band / region.duration_seconds * 100 if region.duration_seconds > 0 else 0.0,
         overshoot_magnitude_c=overshoot_mag,
         overshoot_duration_seconds=overshoot_dur,
+        overshoot_recovery_seconds=overshoot_recovery,
         settling_time_seconds=settling_time,
         oscillation_count=oscillation_count,
         stability_score=stability_score,
@@ -152,11 +169,15 @@ def _compute_overshoot_metrics(
     target_setpoint: float | None,
     tolerance: float,
     dwell_type: RegionType,
-) -> tuple[float, float, float]:
-    """Compute overshoot magnitude, duration, and settling time."""
+) -> tuple[float, float, float, float]:
+    """Compute overshoot magnitude, out-of-band duration, recovery time, settling time.
+
+    Recovery time = seconds from the FIRST excursion beyond the setpoint
+    tolerance until the temperature FIRST returns within tolerance.
+    """
     if target_setpoint is None or len(temperatures) < 2:
-        return 0.0, 0.0, 0.0
-    
+        return 0.0, 0.0, 0.0, 0.0
+
     if dwell_type == RegionType.HOT_DWELL:
         overshoot_mask = temperatures > target_setpoint + tolerance
         peak_idx = np.argmax(temperatures)
@@ -166,23 +187,33 @@ def _compute_overshoot_metrics(
         peak_idx = np.argmin(temperatures)
         overshoot_mag = max(0.0, float(target_setpoint - temperatures[peak_idx]))
     else:
-        return 0.0, 0.0, 0.0
-    
+        return 0.0, 0.0, 0.0, 0.0
+
     overshoot_dur = 0.0
+    recovery = 0.0
     if np.any(overshoot_mask):
         overshoot_indices = np.where(overshoot_mask)[0]
         for i in overshoot_indices:
             if i < len(elapsed) - 1:
                 overshoot_dur += elapsed[i + 1] - elapsed[i]
-    
+
+        # Recovery: first out-of-band sample → first subsequent in-band sample.
+        first_out = int(overshoot_indices[0])
+        in_band = np.abs(temperatures - target_setpoint) <= tolerance
+        recovery = float(elapsed[-1] - elapsed[first_out])  # default: never recovered
+        for j in range(first_out, len(temperatures)):
+            if in_band[j]:
+                recovery = float(elapsed[j] - elapsed[first_out])
+                break
+
     settling_time = 0.0
-    in_band = np.abs(temperatures - target_setpoint) <= tolerance
-    for i in range(len(in_band)):
-        if in_band[i]:
-            settling_time = elapsed[i] - elapsed[0]
+    in_band_all = np.abs(temperatures - target_setpoint) <= tolerance
+    for i in range(len(in_band_all)):
+        if in_band_all[i]:
+            settling_time = float(elapsed[i] - elapsed[0])
             break
-    
-    return overshoot_mag, overshoot_dur, settling_time
+
+    return overshoot_mag, overshoot_dur, recovery, settling_time
 
 
 def _compute_oscillation_count(

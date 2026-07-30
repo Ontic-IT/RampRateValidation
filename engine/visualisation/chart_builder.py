@@ -143,6 +143,9 @@ def build_temperature_trace_chart(
 
     layout = {
         "title": "Temperature Trace with Classification",
+        # Drag draws a box that zooms into that region (box-zoom); the toolbar
+        # Pan button switches to panning, and the scroll wheel also zooms.
+        "dragmode": "zoom",
         "xaxis": {"title": "Elapsed Time (seconds)"},
         "yaxis": {"title": "Temperature (°C)"},
         "hovermode": "closest",
@@ -374,41 +377,65 @@ def build_annotations(
             symbol = "?"
             annotation_type = "INCONCLUSIVE"
 
-        # Get region info for positioning and color
-        source_row_range = (0, 0)
-        x_position = 0
+        # Anchor the annotation AT the event: x at the offending sample, y at
+        # the actual trace temperature there — never at the measured metric
+        # value (which is a deviation in degC, not a chart coordinate).
+        anchor_row = None
         region_colour = "#808080"  # Default gray
-        
+
         if result.region_id and result.region_id in region_map:
             region = region_map[result.region_id]
-            source_row_range = (region.start_row, region.end_row)
-            # Use region midpoint for x-position to distribute across all cycles
-            # Convert from row indices to elapsed seconds
-            midpoint_row = (region.start_row + region.end_row) // 2
-            x_position = row_to_elapsed.get(midpoint_row, midpoint_row)
-            
+            start = max(0, min(region.start_row, len(trace_rows) - 1))
+            end = max(0, min(region.end_row, len(trace_rows) - 1))
+
+            # For setpoint-deviation failures, point at the WORST sample in
+            # the region; otherwise anchor at the region midpoint.
+            anchor_row = (start + end) // 2
+            if "SETPOINT_DEVIATION" in result.requirement_id and end > start:
+                worst_dev = -1.0
+                for i in range(start, end + 1):
+                    row = trace_rows[i]
+                    if row.setpoint_c is not None:
+                        dev = abs(row.temperature_c_raw - row.setpoint_c)
+                        if dev > worst_dev:
+                            worst_dev = dev
+                            anchor_row = i
+
             # Match annotation color to region color for visual clarity
             if region_colour_map:
                 region_type_str = region.primary_classification.value if hasattr(region.primary_classification, 'value') else str(region.primary_classification)
                 region_colour = region_colour_map.get(region_type_str, REGION_COLOURS.get(region.primary_classification, "#808080"))
             else:
                 region_colour = REGION_COLOURS.get(region.primary_classification, "#808080")
-        else:
-            # Fallback to included_rows if no region
-            x_position = result.included_rows if result.included_rows > 0 else 0
 
-        # Only include valid Plotly annotation properties
+        if anchor_row is None:
+            anchor_row = min(max(result.included_rows, 0), len(trace_rows) - 1)
+
+        anchor = trace_rows[anchor_row]
+        x_position = anchor.elapsed_seconds
+        y_position = anchor.temperature_c_raw
+
+        # Stagger arrow offsets so clustered annotations remain readable.
+        stagger = (len(annotations) % 3) * 22
+
         annotations.append({
-            "text": f"{symbol} {result.requirement_id}",
+            "text": (
+                f"{symbol} {result.requirement_id}<br>"
+                f"{result.measured_value:.2f} vs allowed {result.threshold_value:.2f} {result.unit}"
+            ),
             "x": x_position,
-            "y": result.measured_value,
+            "y": y_position,
             "xref": "x",
             "yref": "y",
             "showarrow": True,
             "arrowhead": 2,
             "arrowcolor": region_colour,
+            "ax": 0,
+            "ay": -(40 + stagger),
             "font": {"color": region_colour, "size": 10},
-            "bgcolor": "rgba(255,255,255,0.8)",
+            "bgcolor": "rgba(255,255,255,0.85)",
+            "bordercolor": region_colour,
+            "borderwidth": 1,
         })
 
     audit_log.add(AuditEntry(
@@ -424,31 +451,71 @@ def build_annotations(
     return annotations
 
 
+REGION_LABELS = {
+    RegionType.HEATING_RAMP: "HEATING RAMP",
+    RegionType.COOLING_RAMP: "COOLING RAMP",
+    RegionType.HOT_DWELL: "HOT DWELL",
+    RegionType.COLD_DWELL: "COLD DWELL",
+    RegionType.AMBIENT_START: "AMBIENT",
+    RegionType.HOT_OVERSHOOT: "HOT OVERSHOOT",
+    RegionType.COLD_OVERSHOOT: "COLD OVERSHOOT",
+    RegionType.HOT_CORRECTION: "HOT CORRECTION",
+    RegionType.COLD_CORRECTION: "COLD CORRECTION",
+    RegionType.RECOVERY: "RECOVERY",
+    RegionType.TRANSIENT: "TRANSIENT",
+    RegionType.UNKNOWN: "UNKNOWN",
+}
+
+# A label only fits a region wide enough to read it against; narrower
+# regions stay identified by band colour + the chart legend + hover.
+# (Narrow bands render the label rotated — see build_region_label_overlay.)
+MIN_LABEL_WIDTH_FRACTION = 0.01
+MIN_PHASE_NUMBER_WIDTH_FRACTION = 0.008
+
+# Region classifications that are events of concern — always called out with
+# an arrow annotation pointing at the region, regardless of band width.
+EVENT_REGION_TYPES = {
+    RegionType.HOT_OVERSHOOT,
+    RegionType.COLD_OVERSHOOT,
+    RegionType.HOT_CORRECTION,
+    RegionType.COLD_CORRECTION,
+}
+
+# Call-out gates: an event is only worth an arrow if it is real, not noise.
+OVERSHOOT_CALLOUT_MIN_C = 1.0        # excursion beyond setpoint worth flagging
+OSCILLATION_MIN_CROSSINGS = 6        # sustained ringing, not a couple of wiggles
+OSCILLATION_MIN_RANGE_C = 3.0        # ringing must have real amplitude
+
+
 def build_phase_number_overlay(
     regions: RegionList,
+    trace_rows: list[Any],
     audit_log: AuditLog | None = None,
 ) -> list[dict[str, Any]]:
     """Build phase number overlay annotations for the chart.
-    
-    Places phase numbers at the top of each region for easy identification.
-    
-    Args:
-        regions: Classified regions
-        audit_log: Optional audit log
-    
-    Returns:
-        List of phase number annotation dicts
+
+    Places phase numbers (matching the phase table) above each region wide
+    enough to carry a label without overlap. X positions are in elapsed
+    seconds, matching the chart axis.
     """
     if audit_log is None:
         audit_log = AuditLog()
-    
+
+    row_to_elapsed = {i: row.elapsed_seconds for i, row in enumerate(trace_rows)}
+    span = trace_rows[-1].elapsed_seconds - trace_rows[0].elapsed_seconds if trace_rows else 1.0
+    min_width = span * MIN_PHASE_NUMBER_WIDTH_FRACTION
+
     phase_annotations = []
+    labelled = 0
     for idx, region in enumerate(regions.regions, start=1):
-        # Calculate midpoint of region for x position
-        x_pos = (region.start_row + region.end_row) / 2.0
-        
+        x0 = row_to_elapsed.get(region.start_row, region.start_row)
+        x1 = row_to_elapsed.get(region.end_row, region.end_row)
+        if (x1 - x0) < min_width:
+            continue  # numbered in the phase table; too narrow to label here
+        labelled += 1
+
         phase_annotations.append({
-            "x": x_pos,
+            "x": (x0 + x1) / 2.0,
             "y": 1.02,  # Just above the top of the chart
             "xref": "x",
             "yref": "paper",
@@ -460,18 +527,233 @@ def build_phase_number_overlay(
             "borderwidth": 1,
             "borderpad": 3,
         })
-    
+
     audit_log.add(AuditEntry(
         timestamp=datetime.now(),
         module_name="chart_builder",
         action="build_phase_number_overlay",
         decision="SUCCESS",
-        reason=f"Built phase number overlays for {len(regions.regions)} regions",
+        reason=f"Labelled {labelled} of {len(regions.regions)} regions with phase numbers (width filter)",
         severity=AuditSeverity.INFO,
         category=AuditCategory.METRICS,
     ))
-    
+
     return phase_annotations
+
+
+def build_region_label_overlay(
+    regions: RegionList,
+    trace_rows: list[Any],
+    audit_log: AuditLog | None = None,
+) -> list[dict[str, Any]]:
+    """Classification labels drawn INSIDE each region band.
+
+    This is the point of the tool: the chart must say what each region IS.
+    Regions wide enough get their classification written across the band;
+    narrower regions are covered by the colour legend.
+    """
+    if audit_log is None:
+        audit_log = AuditLog()
+
+    row_to_elapsed = {i: row.elapsed_seconds for i, row in enumerate(trace_rows)}
+    span = trace_rows[-1].elapsed_seconds - trace_rows[0].elapsed_seconds if trace_rows else 1.0
+    min_width = span * MIN_LABEL_WIDTH_FRACTION
+
+    labels = []
+    for region in regions.regions:
+        x0 = row_to_elapsed.get(region.start_row, region.start_row)
+        x1 = row_to_elapsed.get(region.end_row, region.end_row)
+        if (x1 - x0) < min_width:
+            continue
+
+        classification = region.primary_classification
+        text = REGION_LABELS.get(classification, str(classification))
+        colour = REGION_COLOURS.get(classification, "#555555")
+
+        labels.append({
+            "x": (x0 + x1) / 2.0,
+            "y": 0.03,
+            "xref": "x",
+            "yref": "paper",
+            "text": f"<b>{text}</b>",
+            "showarrow": False,
+            "textangle": -90 if (x1 - x0) < span * 0.05 else 0,
+            "font": {"size": 9, "color": colour},
+            "bgcolor": "rgba(255,255,255,0.6)",
+        })
+
+    audit_log.add(AuditEntry(
+        timestamp=datetime.now(),
+        module_name="chart_builder",
+        action="build_region_label_overlay",
+        decision="SUCCESS",
+        reason=f"Built {len(labels)} region classification labels",
+        severity=AuditSeverity.INFO,
+        category=AuditCategory.METRICS,
+    ))
+
+    return labels
+
+
+def build_region_legend_traces(
+    regions: RegionList,
+    region_colour_map: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Legend entries mapping band colours to classification names.
+
+    Plotly shapes carry no legend, so each classification present in the
+    trace gets an invisible marker trace whose legend swatch shows the band
+    colour.
+    """
+    seen: dict[str, str] = {}
+    for region in regions.regions:
+        classification = region.primary_classification
+        name = REGION_LABELS.get(classification, str(classification))
+        if name in seen:
+            continue
+        colour = None
+        if region_colour_map:
+            key = classification.value if hasattr(classification, "value") else str(classification)
+            colour = region_colour_map.get(key)
+        seen[name] = colour or REGION_COLOURS.get(classification, "#CCCCCC")
+
+    return [
+        {
+            "x": [None],
+            "y": [None],
+            "mode": "markers",
+            "marker": {"size": 10, "color": colour, "symbol": "square", "opacity": 0.5},
+            "name": f"Region: {name}",
+            "showlegend": True,
+            "hoverinfo": "skip",
+        }
+        for name, colour in seen.items()
+    ]
+
+
+def build_event_callouts(
+    regions: RegionList,
+    trace_rows: list[Any],
+    dwell_metrics: list[Any] | None = None,
+    setpoint_tolerance_c: float | None = None,
+    audit_log: AuditLog | None = None,
+) -> list[dict[str, Any]]:
+    """Arrow call-outs for events of concern — distinct from region colours.
+
+    Region bands/colours show WHAT every region is; these call-outs draw an
+    arrow to the specific events a reviewer must notice: overshoots,
+    corrections, and oscillatory dwells. They appear only when such an event
+    is present (a clean run has none), pointing at the region in question.
+
+    An overshoot is only flagged when it exceeds the SETPOINT TOLERANCE — an
+    excursion the chamber holds within tolerance is not worth a call-out.
+    """
+    if audit_log is None:
+        audit_log = AuditLog()
+
+    overshoot_threshold = (
+        setpoint_tolerance_c if setpoint_tolerance_c and setpoint_tolerance_c > 0
+        else OVERSHOOT_CALLOUT_MIN_C
+    )
+
+    metrics_by_region = {m.region_id: m for m in (dwell_metrics or [])}
+    callouts: list[dict[str, Any]] = []
+
+    def _anchor(region):
+        start = max(0, min(region.start_row, len(trace_rows) - 1))
+        end = max(0, min(region.end_row, len(trace_rows) - 1))
+        return start, end
+
+    for region in regions.regions:
+        classification = region.primary_classification
+        start, end = _anchor(region)
+        seg = trace_rows[start:end + 1]
+        if not seg:
+            continue
+        temps = [r.temperature_c_raw for r in seg]
+        setpoints_seg = [r.setpoint_c for r in seg if r.setpoint_c is not None]
+        seg_setpoint = float(np.median(setpoints_seg)) if setpoints_seg else None
+        dm = metrics_by_region.get(region.region_id)
+
+        label = None
+        colour = "#B00020"
+        # Overshoot / correction regions: point at the peak/trough.
+        if classification in (RegionType.HOT_OVERSHOOT, RegionType.COLD_OVERSHOOT):
+            is_hot = classification == RegionType.HOT_OVERSHOOT
+            peak_i = int(np.argmax(temps)) if is_hot else int(np.argmin(temps))
+            anchor_row = start + peak_i
+            # Excursion beyond the commanded setpoint at the peak — overshoot
+            # regions are not dwells, so derive it from the row setpoints.
+            if dm and dm.overshoot_magnitude_c:
+                mag = dm.overshoot_magnitude_c
+            elif seg_setpoint is not None:
+                mag = abs(temps[peak_i] - seg_setpoint)
+            else:
+                mag = abs(temps[peak_i] - float(np.median(temps)))
+            if mag <= overshoot_threshold:
+                continue  # within setpoint tolerance — not worth a call-out
+            label = f"⚠ {'HOT' if is_hot else 'COLD'} OVERSHOOT +{mag:.1f}°C"
+            colour = REGION_COLOURS.get(classification, "#DC143C")
+        elif classification in (RegionType.HOT_CORRECTION, RegionType.COLD_CORRECTION):
+            anchor_row = (start + end) // 2
+            label = f"CORRECTION ({'hot' if classification == RegionType.HOT_CORRECTION else 'cold'})"
+            colour = REGION_COLOURS.get(classification, "#FF6347")
+        # Events at a CONTROLLED dwell (hot/cold) only — the ambient soak is
+        # not actively held, so its noise crossings are not oscillations of
+        # concern.
+        elif classification in (RegionType.HOT_DWELL, RegionType.COLD_DWELL) and dm:
+            if dm.overshoot_magnitude_c and dm.overshoot_magnitude_c > overshoot_threshold:
+                is_hot = classification == RegionType.HOT_DWELL
+                peak_i = int(np.argmax(temps)) if is_hot else int(np.argmin(temps))
+                anchor_row = start + peak_i
+                rs = getattr(dm, "overshoot_recovery_seconds", None) or 0
+                recov = (f", recovered in {rs/60:.0f} min" if rs >= 60 else f", recovered in {rs:.0f}s") if rs else ""
+                label = f"⚠ OVERSHOOT +{dm.overshoot_magnitude_c:.1f}°C{recov}"
+                colour = "#DC143C"
+            elif (
+                dm.oscillation_count and dm.oscillation_count >= OSCILLATION_MIN_CROSSINGS
+                and (dm.temperature_range_c or 0.0) >= OSCILLATION_MIN_RANGE_C
+            ):
+                anchor_row = (start + end) // 2
+                label = f"OSCILLATION ({dm.oscillation_count} crossings, ±{(dm.temperature_range_c or 0)/2:.1f}°C)"
+                colour = "#9370DB"
+            else:
+                continue
+        else:
+            continue
+
+        anchor_row = max(0, min(anchor_row, len(trace_rows) - 1))
+        anchor = trace_rows[anchor_row]
+        callouts.append({
+            "x": anchor.elapsed_seconds,
+            "y": anchor.temperature_c_raw,
+            "xref": "x",
+            "yref": "y",
+            "text": f"<b>{label}</b>",
+            "showarrow": True,
+            "arrowhead": 2,
+            "arrowsize": 1.2,
+            "arrowwidth": 2,
+            "arrowcolor": colour,
+            "ax": 0,
+            "ay": -45,
+            "font": {"color": colour, "size": 11},
+            "bgcolor": "rgba(255,255,255,0.9)",
+            "bordercolor": colour,
+            "borderwidth": 1,
+            "borderpad": 3,
+        })
+
+    audit_log.add(AuditEntry(
+        timestamp=datetime.now(),
+        module_name="chart_builder",
+        action="build_event_callouts",
+        decision="SUCCESS",
+        reason=f"Built {len(callouts)} event call-out(s) (overshoot/correction/oscillation)",
+        severity=AuditSeverity.INFO,
+        category=AuditCategory.METRICS,
+    ))
+    return callouts
 
 
 def build_complete_visualisation(
@@ -481,6 +763,8 @@ def build_complete_visualisation(
     validation_results: ValidationResults,
     setpoints: Any = None,
     region_colour_map: dict[str, str] | None = None,
+    dwell_metrics: list[Any] | None = None,
+    setpoint_tolerance_c: float | None = None,
     audit_log: AuditLog | None = None,
 ) -> dict[str, Any]:
     """Build complete visualisation bundle.
@@ -511,16 +795,37 @@ def build_complete_visualisation(
 
     chart = build_temperature_trace_chart(classified_trace, setpoints, audit_log)
     trace_rows = classified_trace.rows
+
+    # Setpoint-relative overlays (setpoint-deviation call-outs, overshoot
+    # markers) only make sense when there IS a setpoint to deviate from. With
+    # no setpoint channel (Mode B) the target is undefined until the reader
+    # picks one in the report, so these are suppressed server-side and instead
+    # drawn client-side against the chosen target.
+    from config.constants import SetpointResolutionMode
+    setpoint_available = bool(
+        setpoints is not None
+        and getattr(setpoints, "resolution_mode", None) == SetpointResolutionMode.MODE_A
+    )
+
     shapes = build_region_overlay(regions, trace_rows, region_colour_map, anomaly_ids=failed_region_ids, audit_log=audit_log)
     cycle_shapes, cycle_annotations = build_cycle_boundary_markers(cycles, trace_rows, audit_log)
-    annotations = build_annotations(validation_results, regions, trace_rows, region_colour_map, audit_log)
-    
-    # Add phase number overlays
-    phase_annotations = build_phase_number_overlay(regions, audit_log)
-    annotations.extend(phase_annotations)
-    
+    annotations = []
+    if setpoint_available:
+        annotations = build_annotations(validation_results, regions, trace_rows, region_colour_map, audit_log)
+
+    # Add phase number overlays and region classification labels
+    annotations.extend(build_phase_number_overlay(regions, trace_rows, audit_log))
+    annotations.extend(build_region_label_overlay(regions, trace_rows, audit_log))
+
+    # Add arrow call-outs for events of concern (overshoot/correction/oscillation)
+    if setpoint_available:
+        annotations.extend(build_event_callouts(regions, trace_rows, dwell_metrics, setpoint_tolerance_c, audit_log))
+
     # Add cycle labels
     annotations.extend(cycle_annotations)
+
+    # Legend entries for the region band colours (shapes carry no legend)
+    chart["data"] = chart["data"] + build_region_legend_traces(regions, region_colour_map)
 
     # Combine all shapes (regions + cycle boundaries)
     chart["layout"]["shapes"] = shapes + cycle_shapes

@@ -1,0 +1,16 @@
+{
+  "name": "ADC",
+  "ambient_c": 22,
+  "hot_c": 55,
+  "cold_c": -40,
+  "heat_rate_c_per_min": 5,
+  "cool_rate_c_per_min": 5,
+  "cycle_segments": [
+    {"from_c": -40, "to_c": -40, "duration_s": 9660},
+    {"from_c": -40, "to_c": 55, "duration_s": 1140},
+    {"from_c": 55, "to_c": 55, "duration_s": 16860},
+    {"from_c": 55, "to_c": -40, "duration_s": 1140}
+  ],
+  "levels": [-40, 22, 55],
+  "source": "Meggitt Avionics spec 260/39141 Issue 2, Fig 2-3 (The Burn-In Thermal Cycle): 8-hour cycle, 3 h at -40 C then 5 h at +55 C, transitions >= 5 C/min, dwell to within 2 C. No .pgm; declared from the written spec."
+}

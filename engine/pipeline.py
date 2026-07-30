@@ -76,6 +76,26 @@ def _execute_pipeline(context: AnalysisContext) -> AnalysisContext:
         _stage_normalise_to_canonical_trace,
     )
     
+    # Check ingest validity gate (set during normalisation)
+    if context.ingest_blocked:
+        reasons = "; ".join(context.ingest_validity.flags) if context.ingest_validity else ""
+        context.audit_log.add(AuditEntry(
+            timestamp=datetime.now(),
+            module_name="pipeline",
+            action="ingest_validity_gate",
+            decision="BLOCKED",
+            reason=f"Trace is not an analysable ramp-rate test - pipeline stopped: {reasons}",
+            severity=AuditSeverity.ERROR,
+            category=AuditCategory.PIPELINE,
+        ))
+        from models.domain import OverallStatus
+        from config.constants import OverallValidationStatus
+        context.overall_validation_status = OverallStatus(
+            status=OverallValidationStatus.INVALID_INPUT,
+            reason=f"Ingest validity gate: {reasons}",
+        )
+        return context
+
     # Stage 3: Preprocess trace
     context = _execute_stage(
         context,
@@ -279,17 +299,27 @@ def _stage_ingest_source_file(context: AnalysisContext) -> AnalysisContext:
 
 
 def _stage_normalise_to_canonical_trace(context: AnalysisContext) -> AnalysisContext:
-    """Stage 2: Normalize to canonical trace."""
+    """Stage 2: Normalize to canonical trace, then gate on ingest validity."""
     from prereq.normalisation.trace_builder import build_canonical_trace
-    
+    from prereq.normalisation.validity_gate import evaluate_ingest_validity
+
     canonical_trace = build_canonical_trace(
         raw_trace=context.raw_trace,
         file_metadata=context.file_metadata,
         audit_log=context.audit_log,
     )
-    
+
     context.canonical_trace = canonical_trace
-    
+
+    # Ingest validity gate: fragments and non-ramp captures (e.g. Vib2
+    # vibration screens) are flagged/blocked at the door, with reasons.
+    context.ingest_validity = evaluate_ingest_validity(
+        canonical_trace=canonical_trace,
+        file_metadata=context.file_metadata,
+        audit_log=context.audit_log,
+    )
+    context.ingest_blocked = context.ingest_validity.verdict == "INVALID"
+
     return context
 
 
@@ -365,10 +395,17 @@ def _stage_infer_or_resolve_setpoints(context: AnalysisContext) -> AnalysisConte
     """Stage 6: Infer or resolve setpoints."""
     from workers.setpoint_resolution.setpoint_inference import resolve_setpoints
     
+    # Mode A when the file actually carries a setpoint channel — read the
+    # commanded levels directly rather than inferring them from measured
+    # temperature (which can miscluster on multi-level programmes).
+    setpoint_channel_present = bool(
+        context.file_metadata and context.file_metadata.selected_setpoint_channel
+    )
     setpoints = resolve_setpoints(
         trace=context.preprocessed_trace,
         preprocessing_report=context.preprocessing_report,
         process_boundaries=context.process_boundaries,
+        setpoint_channel_present=setpoint_channel_present,
         audit_log=context.audit_log,
     )
     
@@ -380,6 +417,7 @@ def _stage_infer_or_resolve_setpoints(context: AnalysisContext) -> AnalysisConte
         preprocessing_report=context.preprocessing_report,
         setpoints=setpoints,
         boundaries=context.process_boundaries,
+        trace=context.preprocessed_trace,
     )
     
     return context
@@ -564,6 +602,15 @@ def _stage_build_visualisation_payload(context: AnalysisContext) -> AnalysisCont
         # Skip if missing required data
         return context
     
+    # Resolved dwell setpoint tolerance — overshoots are flagged on the chart
+    # only when they exceed it.
+    setpoint_tolerance_c = None
+    if context.profile and getattr(context.profile, "tolerance_resolutions", None):
+        for res in context.profile.tolerance_resolutions:
+            if res.parameter_name == "dwell_setpoint_deviation":
+                setpoint_tolerance_c = res.resolved_value
+                break
+
     chart = build_complete_visualisation(
         classified_trace=context.classified_trace,
         regions=context.region_list,
@@ -571,6 +618,8 @@ def _stage_build_visualisation_payload(context: AnalysisContext) -> AnalysisCont
         validation_results=context.validation_results,
         setpoints=context.resolved_setpoints,
         region_colour_map=context.profile.visualisation_settings.region_colour_map if context.profile else None,
+        dwell_metrics=context.metric_set.dwell_metrics if context.metric_set else None,
+        setpoint_tolerance_c=setpoint_tolerance_c,
         audit_log=context.audit_log,
     )
     
@@ -626,11 +675,30 @@ def _build_analysis_result(context: AnalysisContext) -> AnalysisResult:
     else:
         status = OverallValidationStatus.INCONCLUSIVE
         status_reason = "Pipeline completed but no validation status available"
+
+    # An ingest-validity flag must be visible in the headline status: a
+    # "PASS" on a trace the gate says is not a ramp test is a misfire.
+    if context.ingest_validity and context.ingest_validity.verdict == "FLAGGED":
+        gate_flags = "; ".join(context.ingest_validity.flags)
+        if status == OverallValidationStatus.PASS:
+            status = OverallValidationStatus.PASS_WITH_WARNINGS
+            status_reason = f"{status_reason} | Ingest validity flagged: {gate_flags}"
+        elif status == OverallValidationStatus.FAIL and any(
+            "not a temperature ramp test" in f for f in context.ingest_validity.flags
+        ):
+            # A capture that is not a temperature ramp test cannot FAIL a
+            # ramp-rate validation — there is no valid verdict to render.
+            status = OverallValidationStatus.INCONCLUSIVE
+            status_reason = (
+                f"Not analysable as a ramp-rate test: {gate_flags} "
+                f"(ramp verdict withheld)"
+            )
     
     return AnalysisResult(
         status=status,
         status_reason=status_reason,
         canonical_trace=context.canonical_trace,
+        ingest_validity=context.ingest_validity,
         data_quality_report=context.data_quality_report,
         validation_profile_used=context.profile,
         inferred_setpoints=context.resolved_setpoints,

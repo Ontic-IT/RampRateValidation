@@ -166,4 +166,11 @@ class ValidationProfile(BaseModel):
             return self.setpoint_deviation_requirements.allowed_setpoint_deviation_c
         elif parameter_name == "ramp_deviation":
             return self.ramp_rate_requirements.allowed_ramp_deviation_c
+        elif parameter_name == "required_heating_ramp_rate":
+            # 0.0 is the documented "not specified — derive from trace" placeholder
+            value = self.ramp_rate_requirements.required_heating_ramp_rate_c_per_min
+            return value if value > 0 else None
+        elif parameter_name == "required_cooling_ramp_rate":
+            value = self.ramp_rate_requirements.required_cooling_ramp_rate_c_per_min
+            return value if value > 0 else None
         return None

@@ -5,6 +5,7 @@ Generates Excel reports from report payload using openpyxl.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -54,8 +55,11 @@ def generate_excel_report(
 
     # Create a sheet for each section
     for section_name, section_data in report_package.sections.items():
-        title = section_data.get("title", section_name)[:31]  # Excel sheet name limit
-        ws = wb.create_sheet(title=title)
+        title = section_data.get("title", section_name)
+        # Excel forbids : \ / ? * [ ] in sheet names and caps length at 31
+        # (e.g. "Setpoint/Dwell Inference Summary" is invalid as-is).
+        sheet_title = re.sub(r"[:\\/?*\[\]]", "-", title)[:31]
+        ws = wb.create_sheet(title=sheet_title)
         
         # Header style
         header_font = Font(bold=True, size=12)

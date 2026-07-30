@@ -37,13 +37,26 @@ def universal_ingest(
     Raises:
         InputFormatError: If file cannot be parsed as tabular data
     """
+    # Delegate to the adaptive loader so the two ingestion paths cannot
+    # drift apart: load_trace_file performs the same structural read plus
+    # evidence-based channel assignment.
+    from inputs.file_loader import load_trace_file
+
+    return load_trace_file(file_path, audit_log=audit_log)
+
+
+def _legacy_universal_ingest(
+    file_path: str,
+    audit_log: AuditLog | None = None,
+) -> tuple[RawTraceData, FileMetadata]:
+    """Pre-adaptive implementation, retained for reference."""
     if audit_log is None:
         audit_log = AuditLog()
-    
+
     path = Path(file_path)
     if not path.exists():
         raise InputFormatError(f"File not found: {file_path}")
-    
+
     # Try multiple ingestion strategies
     strategies = [
         {"sep": "\t", "encoding": "utf-8", "name": "tab-delimited UTF-8"},

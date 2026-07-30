@@ -31,40 +31,77 @@ from models.domain import (
 )
 
 
+def _band_result(
+    measured: float,
+    target: float,
+    tolerance: float,
+) -> tuple[ValidationStatus, str]:
+    """Two-sided band conformance: |measured - target| <= tolerance.
+
+    Ramp-rate conformance is about tracking the COMMANDED trajectory, so both
+    a shortfall AND an overshoot are deviations. Ramping much faster than the
+    profile commanded is off-profile (product sees a different thermal
+    stress), not a free pass — the old one-sided floor let any fast ramp
+    through. A within-tolerance-but-fast ramp still passes; only a rate
+    outside the band fails, and the reason states which side.
+    """
+    deviation = measured - target
+    if abs(deviation) <= tolerance:
+        return (
+            ValidationStatus.PASS,
+            f"Rate {measured:.2f} within {target:.2f}+/-{tolerance:.2f} degC/min "
+            f"(deviation {deviation:+.2f})",
+        )
+    if deviation > 0:
+        return (
+            ValidationStatus.FAIL,
+            f"Rate {measured:.2f} exceeds commanded {target:.2f} by "
+            f"{deviation:.2f} degC/min (> tolerance {tolerance:.2f}) — ramping "
+            "faster than the programmed trajectory",
+        )
+    return (
+        ValidationStatus.FAIL,
+        f"Rate {measured:.2f} falls short of commanded {target:.2f} by "
+        f"{abs(deviation):.2f} degC/min (> tolerance {tolerance:.2f})",
+    )
+
+
 def validate_heating_ramp_rate(
     valid_ramp: ValidRampRegion,
     ramp_metrics: RampMetrics,
     required_rate_c_per_min: float,
     minimum_sustained_ratio: float = 0.8,
+    tolerance_c_per_min: float | None = None,
     audit_log: AuditLog | None = None,
 ) -> ValidationResult:
-    """Validate heating ramp rate against profile requirement.
-    
-    PASS iff:
-    - robust_ramp_slope >= required_rate
-    - minimum_sustained >= required_rate × ratio
-    
+    """Validate heating ramp rate against the commanded rate as a BAND.
+
+    PASS iff |robust_ramp_slope - target| <= tolerance. `required_rate_c_per_min`
+    is the band centre (commanded/target rate); `tolerance_c_per_min` its
+    half-width (defaults to 20% of target when not supplied).
+
     Args:
         valid_ramp: Valid ramp region
         ramp_metrics: Computed ramp metrics
-        required_rate_c_per_min: Required heating rate from profile
-        minimum_sustained_ratio: Ratio for minimum sustained check
+        required_rate_c_per_min: Target (commanded) heating rate — band centre
+        minimum_sustained_ratio: Retained for signature stability (unused by band)
+        tolerance_c_per_min: Band half-width; default 20% of target
         audit_log: Optional audit log
-    
+
     Returns:
         ValidationResult with pass/fail decision
     """
     if audit_log is None:
         audit_log = AuditLog()
-    
+
     if valid_ramp.direction != RampDirection.HEATING:
         return ValidationResult(
             validation_result_id=str(uuid.uuid4()),
             requirement_id="HEATING_RAMP_RATE",
-            requirement_description=f"Heating ramp rate >= {required_rate_c_per_min} °C/min",
+            requirement_description=f"Heating ramp rate within band of {required_rate_c_per_min} °C/min",
             measured_value=0.0,
             threshold_value=required_rate_c_per_min,
-            comparator=Comparator.GTE,
+            comparator=Comparator.WITHIN_RANGE,
             unit="°C/min",
             method="theil_sen",
             region_id=valid_ramp.region_id,
@@ -72,31 +109,20 @@ def validate_heating_ramp_rate(
             result=ValidationStatus.NOT_APPLICABLE,
             reason="Not a heating ramp",
         )
-    
+
+    target = required_rate_c_per_min
+    tolerance = tolerance_c_per_min if tolerance_c_per_min is not None else abs(target) * 0.20
     robust_slope = ramp_metrics.robust_slope_c_per_min
-    min_sustained = ramp_metrics.minimum_sustained_slope_c_per_min
-    sustained_threshold = required_rate_c_per_min * minimum_sustained_ratio
-    
-    robust_pass = robust_slope >= required_rate_c_per_min
-    sustained_pass = min_sustained >= sustained_threshold
-    
-    if robust_pass and sustained_pass:
-        result = ValidationStatus.PASS
-        reason = f"Robust slope {robust_slope:.2f} >= {required_rate_c_per_min}, sustained {min_sustained:.2f} >= {sustained_threshold:.2f}"
-    elif robust_pass and not sustained_pass:
-        result = ValidationStatus.PASS_WITH_WARNINGS
-        reason = f"Robust slope {robust_slope:.2f} passes, but sustained {min_sustained:.2f} < {sustained_threshold:.2f}"
-    else:
-        result = ValidationStatus.FAIL
-        reason = f"Robust slope {robust_slope:.2f} < required {required_rate_c_per_min}"
-    
+
+    result, reason = _band_result(robust_slope, target, tolerance)
+
     validation_result = ValidationResult(
         validation_result_id=str(uuid.uuid4()),
         requirement_id="HEATING_RAMP_RATE",
-        requirement_description=f"Heating ramp rate >= {required_rate_c_per_min} °C/min",
+        requirement_description=f"Heating ramp rate = {target:.2f} +/- {tolerance:.2f} °C/min",
         measured_value=robust_slope,
-        threshold_value=required_rate_c_per_min,
-        comparator=Comparator.GTE,
+        threshold_value=target,
+        comparator=Comparator.WITHIN_RANGE,
         unit="°C/min",
         method="theil_sen",
         region_id=valid_ramp.region_id,
@@ -105,7 +131,7 @@ def validate_heating_ramp_rate(
         result=result,
         reason=reason,
     )
-    
+
     audit_log.add(AuditEntry(
         timestamp=datetime.now(),
         module_name="ramp_rules",
@@ -114,11 +140,11 @@ def validate_heating_ramp_rate(
         output_reference=validation_result.validation_result_id,
         decision=result.value,
         reason=reason,
-        thresholds_used={"required": required_rate_c_per_min, "sustained_ratio": minimum_sustained_ratio},
+        thresholds_used={"target": target, "tolerance": tolerance},
         severity=AuditSeverity.INFO,
         category=AuditCategory.VALIDATION,
     ))
-    
+
     return validation_result
 
 
@@ -127,33 +153,36 @@ def validate_cooling_ramp_rate(
     ramp_metrics: RampMetrics,
     required_rate_c_per_min: float,
     minimum_sustained_ratio: float = 0.8,
+    tolerance_c_per_min: float | None = None,
     audit_log: AuditLog | None = None,
 ) -> ValidationResult:
-    """Validate cooling ramp rate against profile requirement.
-    
-    Note: Cooling rates are negative, so we compare absolute values.
-    
+    """Validate cooling ramp rate against the commanded rate as a BAND.
+
+    Cooling rates are negative; the band is applied to magnitudes. PASS iff
+    ||robust_slope| - target| <= tolerance.
+
     Args:
         valid_ramp: Valid ramp region
         ramp_metrics: Computed ramp metrics
-        required_rate_c_per_min: Required cooling rate (positive value)
-        minimum_sustained_ratio: Ratio for minimum sustained check
+        required_rate_c_per_min: Target (commanded) cooling rate (positive) — band centre
+        minimum_sustained_ratio: Retained for signature stability (unused by band)
+        tolerance_c_per_min: Band half-width; default 20% of target
         audit_log: Optional audit log
-    
+
     Returns:
         ValidationResult with pass/fail decision
     """
     if audit_log is None:
         audit_log = AuditLog()
-    
+
     if valid_ramp.direction != RampDirection.COOLING:
         return ValidationResult(
             validation_result_id=str(uuid.uuid4()),
             requirement_id="COOLING_RAMP_RATE",
-            requirement_description=f"Cooling ramp rate >= {required_rate_c_per_min} °C/min",
+            requirement_description=f"Cooling ramp rate within band of {required_rate_c_per_min} °C/min",
             measured_value=0.0,
             threshold_value=required_rate_c_per_min,
-            comparator=Comparator.GTE,
+            comparator=Comparator.WITHIN_RANGE,
             unit="°C/min",
             method="theil_sen",
             region_id=valid_ramp.region_id,
@@ -161,31 +190,20 @@ def validate_cooling_ramp_rate(
             result=ValidationStatus.NOT_APPLICABLE,
             reason="Not a cooling ramp",
         )
-    
+
+    target = abs(required_rate_c_per_min)
+    tolerance = tolerance_c_per_min if tolerance_c_per_min is not None else abs(target) * 0.20
     robust_slope = abs(ramp_metrics.robust_slope_c_per_min)
-    min_sustained = abs(ramp_metrics.minimum_sustained_slope_c_per_min)
-    sustained_threshold = required_rate_c_per_min * minimum_sustained_ratio
-    
-    robust_pass = robust_slope >= required_rate_c_per_min
-    sustained_pass = min_sustained >= sustained_threshold
-    
-    if robust_pass and sustained_pass:
-        result = ValidationStatus.PASS
-        reason = f"Robust slope {robust_slope:.2f} >= {required_rate_c_per_min}, sustained {min_sustained:.2f} >= {sustained_threshold:.2f}"
-    elif robust_pass and not sustained_pass:
-        result = ValidationStatus.PASS_WITH_WARNINGS
-        reason = f"Robust slope {robust_slope:.2f} passes, but sustained {min_sustained:.2f} < {sustained_threshold:.2f}"
-    else:
-        result = ValidationStatus.FAIL
-        reason = f"Robust slope {robust_slope:.2f} < required {required_rate_c_per_min}"
-    
+
+    result, reason = _band_result(robust_slope, target, tolerance)
+
     validation_result = ValidationResult(
         validation_result_id=str(uuid.uuid4()),
         requirement_id="COOLING_RAMP_RATE",
-        requirement_description=f"Cooling ramp rate >= {required_rate_c_per_min} °C/min",
+        requirement_description=f"Cooling ramp rate = {target:.2f} +/- {tolerance:.2f} °C/min",
         measured_value=robust_slope,
-        threshold_value=required_rate_c_per_min,
-        comparator=Comparator.GTE,
+        threshold_value=target,
+        comparator=Comparator.WITHIN_RANGE,
         unit="°C/min",
         method="theil_sen",
         region_id=valid_ramp.region_id,
@@ -194,7 +212,7 @@ def validate_cooling_ramp_rate(
         result=result,
         reason=reason,
     )
-    
+
     audit_log.add(AuditEntry(
         timestamp=datetime.now(),
         module_name="ramp_rules",
@@ -203,11 +221,11 @@ def validate_cooling_ramp_rate(
         output_reference=validation_result.validation_result_id,
         decision=result.value,
         reason=reason,
-        thresholds_used={"required": required_rate_c_per_min, "sustained_ratio": minimum_sustained_ratio},
+        thresholds_used={"target": target, "tolerance": tolerance},
         severity=AuditSeverity.INFO,
         category=AuditCategory.VALIDATION,
     ))
-    
+
     return validation_result
 
 

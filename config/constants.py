@@ -17,6 +17,11 @@ class RegionType(str, Enum):
     HOT_CORRECTION = "HOT_CORRECTION"
     COLD_CORRECTION = "COLD_CORRECTION"
     RECOVERY = "RECOVERY"
+    # Trace-intrinsic repeated wiggle around a level. Used when there is NO
+    # setpoint to measure against: you can see the temperature oscillating, but
+    # cannot call it an overshoot (or say by how much) until a target is known.
+    # With a target selected, overshoots are quantified against it.
+    OSCILLATION = "OSCILLATION"
     TRANSIENT = "TRANSIENT"
     UNKNOWN = "UNKNOWN"
 

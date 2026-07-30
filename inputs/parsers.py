@@ -219,6 +219,199 @@ def _parse_single_timestamp(value: str, format_hint: str) -> datetime:
         return datetime(2000, 1, 1)
 
 
+# ---------------------------------------------------------------------------
+# Evidence-based time decoding (used by the adaptive normalisation path)
+# ---------------------------------------------------------------------------
+
+def decode_time_series(
+    values: pd.Series,
+    kind: str,
+    time_values: pd.Series | None = None,
+    anchor: datetime | None = None,
+    filename_date: datetime | None = None,
+) -> tuple[list[datetime], list[str]]:
+    """Decode a time channel into datetimes using structural evidence.
+
+    Args:
+        values: The primary time column (dates, datetimes, serials or seconds).
+        kind: One of datetime|datetime_pair|datetime_objects|excel_serial|
+              epoch_seconds|elapsed_seconds (from channel assignment).
+        time_values: The time-of-day column when kind == "datetime_pair".
+        anchor: Absolute anchor for elapsed_seconds traces.
+        filename_date: Independent date evidence used to disambiguate
+              day-first vs month-first formats.
+
+    Returns:
+        (timestamps, notes) — notes record every disambiguation decision.
+    """
+    notes: list[str] = []
+
+    if kind == "elapsed_seconds":
+        base = anchor or datetime(2000, 1, 1)
+        notes.append(
+            f"elapsed seconds anchored to {base.isoformat()}"
+            + ("" if anchor else " (no anchor evidence found; placeholder epoch)")
+        )
+        secs = pd.to_numeric(values, errors="coerce")
+        return [base + timedelta(seconds=float(s)) for s in secs], notes
+
+    if kind == "epoch_seconds":
+        secs = pd.to_numeric(values, errors="coerce")
+        return [datetime.fromtimestamp(float(s)) for s in secs], notes
+
+    if kind == "excel_serial":
+        serials = pd.to_numeric(values, errors="coerce")
+        epoch = datetime(1899, 12, 30)
+        return [epoch + timedelta(days=float(s)) for s in serials], notes
+
+    if kind == "datetime_pair":
+        if time_values is None:
+            raise ValueError("datetime_pair decoding requires the time column")
+        combined = _combine_date_time(values, time_values)
+        ts = _parse_with_dayfirst_resolution(combined, filename_date, notes)
+        return _repair_daymonth_swaps(ts, notes), notes
+
+    if kind == "datetime_objects":
+        ts = [v.to_pydatetime() if isinstance(v, pd.Timestamp) else v for v in values]
+        return _repair_daymonth_swaps(ts, notes), notes
+
+    # kind == "datetime": full datetime strings
+    strings = values.astype(str).str.strip()
+    ts = _parse_with_dayfirst_resolution(strings, filename_date, notes)
+    return _repair_daymonth_swaps(ts, notes), notes
+
+
+def _combine_date_time(dates: pd.Series, times: pd.Series) -> pd.Series:
+    """Combine a date column and a time column into datetime strings."""
+    def date_str(v) -> str:
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return v.strftime("%m/%d/%Y")  # unambiguous once formatted
+        return str(v).strip()
+
+    def time_str(v) -> str:
+        if hasattr(v, "strftime") and not isinstance(v, (int, float)):
+            return v.strftime("%H:%M:%S")
+        return str(v).strip()
+
+    return pd.Series(
+        [f"{date_str(d)} {time_str(t)}" for d, t in zip(dates, times)],
+        index=dates.index,
+    )
+
+
+def _parse_with_dayfirst_resolution(
+    strings: pd.Series,
+    filename_date: datetime | None,
+    notes: list[str],
+) -> list[datetime]:
+    """Parse datetime strings, resolving day-first ambiguity by evidence.
+
+    Evidence hierarchy: (1) an interpretation that fails outright is wrong;
+    (2) a trace's timestamps are monotonic — the interpretation that keeps
+    them so is right; (3) independent filename date evidence; (4) if still
+    tied the interpretations agree on every row, so the choice is moot.
+    """
+    candidates: dict[str, pd.Series | None] = {}
+    for label, dayfirst in (("month-first", False), ("day-first", True)):
+        parsed = None
+        try:
+            parsed = pd.to_datetime(strings, dayfirst=dayfirst, errors="raise")
+        except (ValueError, TypeError):
+            # Excel round-trips can leave MIXED formats in one column
+            # (text dates alongside re-typed datetime cells).
+            try:
+                parsed = pd.to_datetime(strings, dayfirst=dayfirst, format="mixed", errors="raise")
+            except (ValueError, TypeError):
+                parsed = None
+        candidates[label] = parsed
+
+    valid = {k: v for k, v in candidates.items() if v is not None}
+    if not valid:
+        raise ValueError(f"Could not parse timestamps (sample: {strings.iloc[0]!r})")
+
+    if len(valid) == 2:
+        mf, df_ = candidates["month-first"], candidates["day-first"]
+        if mf.equals(df_):
+            valid = {"month-first": mf}  # unambiguous rows; choice is moot
+        else:
+            mono = {k: bool(v.is_monotonic_increasing) for k, v in valid.items()}
+            if sum(mono.values()) == 1:
+                keep = next(k for k, m in mono.items() if m)
+                notes.append(f"date order resolved to {keep} by timestamp monotonicity")
+                valid = {keep: valid[keep]}
+            elif filename_date is not None:
+                dist = {
+                    k: abs((v.iloc[0].to_pydatetime() - filename_date).total_seconds())
+                    for k, v in valid.items()
+                }
+                keep = min(dist, key=dist.get)
+                notes.append(f"date order resolved to {keep} by filename date evidence")
+                valid = {keep: valid[keep]}
+            else:
+                notes.append(
+                    "date order ambiguous (both interpretations monotonic, no "
+                    "filename evidence); defaulted to month-first"
+                )
+                valid = {"month-first": valid["month-first"]}
+
+    parsed = next(iter(valid.values()))
+    return [v.to_pydatetime() for v in parsed]
+
+
+def _repair_daymonth_swaps(ts: list[datetime], notes: list[str]) -> list[datetime]:
+    """Repair day/month transposition introduced by spreadsheet locales.
+
+    Symptom: a continuous trace whose date field jumps by ~a month at a
+    midnight rollover (Feb 2 23:59 -> Mar 2 00:00 instead of Feb 3). The
+    repair swaps day/month wherever doing so restores the sampling cadence.
+    """
+    if len(ts) < 3:
+        return ts
+
+    deltas = [(ts[i + 1] - ts[i]).total_seconds() for i in range(len(ts) - 1)]
+    positive = sorted(d for d in deltas if d > 0)
+    if not positive:
+        return ts
+    cadence = positive[len(positive) // 2]
+    threshold = max(cadence * 100, 3600.0)  # a >100x cadence jump is structural
+
+    repaired = list(ts)
+    fixes = 0
+    for i in range(len(repaired) - 1):
+        gap = (repaired[i + 1] - repaired[i]).total_seconds()
+        if abs(gap) <= threshold:
+            continue
+        nxt = repaired[i + 1]
+        if nxt.day > 12:
+            continue  # swap impossible
+        try:
+            swapped = nxt.replace(day=nxt.month, month=nxt.day)
+        except ValueError:
+            continue
+        if abs((swapped - repaired[i]).total_seconds()) <= threshold:
+            # Swap forward only while each swap preserves cadence continuity.
+            j = i + 1
+            while j < len(repaired):
+                cur = repaired[j]
+                if cur.day > 12:
+                    break
+                try:
+                    candidate = cur.replace(day=cur.month, month=cur.day)
+                except ValueError:
+                    break
+                if abs((candidate - repaired[j - 1]).total_seconds()) > threshold:
+                    break
+                repaired[j] = candidate
+                fixes += 1
+                j += 1
+    if fixes:
+        notes.append(
+            f"repaired day/month transposition on {fixes} rows (spreadsheet "
+            "locale damage detected via cadence continuity)"
+        )
+    return repaired
+
+
 TEMPERATURE_PATTERNS = {
     "celsius": [r"temp.*\(?\s*[°]?\s*c\s*\)?", r"temperature.*c", r"tc\d*", r"ch\d+"],
     "fahrenheit": [r"temp.*\(?\s*[°]?\s*f\s*\)?", r"temperature.*f"],

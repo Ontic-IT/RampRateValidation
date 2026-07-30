@@ -43,113 +43,66 @@ def load_trace_file(
     setpoint_channel: str | None = None,
     audit_log: AuditLog | None = None,
 ) -> tuple[RawTraceData, FileMetadata]:
-    """Load a trace file using format-agnostic universal ingestion.
-    
-    Philosophy: Try multiple delimiters and encodings, auto-detect data start,
-    preserve all columns. No hardcoded format assumptions.
-    
+    """Load a trace file using adaptive, evidence-based ingestion.
+
+    Stage 1 locates the data table structurally (any delimiter, encoding,
+    Excel sheet, preamble depth). Channel roles are then assigned from the
+    data's behavior — the setpoint is the piecewise-constant command, the
+    temperature is the channel that converges to it — with header names as
+    a corroborating witness, never the sole authority. Ambiguity is refused
+    with an explanation rather than guessed. All columns are preserved.
+
     Args:
         file_path: Path to the trace file
-        channel: Optional specific temperature channel to use
-        setpoint_channel: Optional specific setpoint channel to use
+        channel: Optional explicit temperature channel (overrides detection)
+        setpoint_channel: Optional explicit setpoint channel
         audit_log: Optional audit log to record decisions
-    
+
     Returns:
         Tuple of (RawTraceData, FileMetadata)
-    
+
     Raises:
-        InputFormatError: If file cannot be parsed or has no usable data
+        InputFormatError: If the file cannot be parsed, or channel roles are
+            ambiguous and no override is given.
     """
+    from inputs.structure import (
+        read_structured,
+        extract_preamble_metadata,
+        extract_time_anchor,
+    )
+    from prereq.normalisation.channel_assignment import assign_channels
+
     path = Path(file_path)
     if not path.exists():
         raise InputFormatError(f"File not found: {file_path}")
-    
+
     if audit_log is None:
         audit_log = AuditLog()
-    
-    # Try multiple ingestion strategies (format-agnostic)
-    # Include different skiprows values to handle preambles
-    strategies = []
-    for sep, enc, name in [
-        ("\t", "utf-8", "tab-delimited UTF-8"),
-        (",", "utf-8", "comma-delimited UTF-8"),
-        (";", "utf-8", "semicolon-delimited UTF-8"),
-        ("\t", "latin-1", "tab-delimited Latin-1"),
-        (",", "latin-1", "comma-delimited Latin-1"),
-    ]:
-        for skiprows in [0, 1, 2, 3, 4, 5]:
-            strategies.append({
-                "sep": sep,
-                "encoding": enc,
-                "skiprows": skiprows,
-                "name": f"{name} (skip {skiprows})"
-            })
-    
-    df = None
-    successful_strategy = None
-    
-    for strategy in strategies:
-        try:
-            df = pd.read_csv(
-                file_path,
-                sep=strategy["sep"],
-                encoding=strategy["encoding"],
-                skiprows=strategy["skiprows"],
-                on_bad_lines="skip",
-                low_memory=False,
-            )
-            
-            # Check if we got usable data (at least 2 columns)
-            if not df.empty and len(df.columns) >= 2:
-                successful_strategy = strategy
-                break
-                
-        except Exception:
-            continue
-    
-    if df is None or df.empty:
-        raise InputFormatError(
-            f"Could not parse {file_path} as tabular data. "
-            "Tried tab, comma, semicolon delimiters with multiple encodings."
-        )
-    
-    # Auto-detect where numeric data starts (skip preamble)
-    data_start_row = _find_data_start(df)
-    preamble_rows = successful_strategy["skiprows"] + data_start_row
-    if data_start_row > 0:
-        df = df.iloc[data_start_row:].reset_index(drop=True)
-    
-    # Clean column names (strip whitespace)
+
+    table = read_structured(file_path)
+    df = table.df
     df.columns = [str(col).strip() for col in df.columns]
-    
     columns = list(df.columns)
-    
-    # Content-based column detection (not name-based)
-    time_col = _detect_time_column_by_content(df, columns)
-    if time_col is None:
-        time_col = columns[0] if columns else None
-        if time_col is None:
-            raise InputFormatError("No time column detected")
-    
-    timestamp_samples = df[time_col].head(10).astype(str).tolist()
-    timestamp_format = detect_timestamp_format(timestamp_samples)
-    
-    # Temperature column detection
+
+    preamble_meta = extract_preamble_metadata(table.preamble_lines, file_path)
+    if table.sheet_name:
+        preamble_meta["sheet_name"] = str(table.sheet_name)
+
+    assignment = assign_channels(df)
+
+    # Explicit overrides always win (the operator is the ultimate witness).
     if channel:
-        temp_col = channel
-        if temp_col not in columns:
-            raise InputFormatError(f"Specified channel '{channel}' not found in columns: {columns}")
-    else:
-        temp_col = _detect_temperature_column_by_content(df, columns, time_col)
-        if temp_col is None:
-            raise InputFormatError("No temperature column detected")
-    
-    temp_unit = detect_temperature_unit(temp_col)
-    
-    # Setpoint column detection (optional)
+        if channel not in columns:
+            raise InputFormatError(
+                f"Specified channel '{channel}' not found in columns: {columns}"
+            )
+        assignment.temperature_channel = channel
+        assignment.evidence.append(f"temperature: '{channel}' explicitly specified by caller")
     if setpoint_channel:
-        sp_col = setpoint_channel
-        if sp_col not in columns:
+        if setpoint_channel in columns:
+            assignment.setpoint_channel = setpoint_channel
+            assignment.evidence.append(f"setpoint: '{setpoint_channel}' explicitly specified by caller")
+        else:
             audit_log.add(AuditEntry(
                 timestamp=datetime.now(),
                 module_name="file_loader",
@@ -159,47 +112,79 @@ def load_trace_file(
                 severity=AuditSeverity.WARNING,
                 category=AuditCategory.QUALITY,
             ))
-            sp_col = None
-    else:
-        sp_col = _detect_setpoint_column_by_content(df, columns, time_col, temp_col)
-        if sp_col is None:
-            audit_log.add(AuditEntry(
-                timestamp=datetime.now(),
-                module_name="file_loader",
-                action="no_setpoint_channel",
-                decision="WARNING",
-                reason="No setpoint channel detected - will use Mode B inference",
-                severity=AuditSeverity.WARNING,
-                category=AuditCategory.QUALITY,
-            ))
-    
+
+    if assignment.temperature_channel is None:
+        raise InputFormatError("No temperature column detected")
+
+    time_col = assignment.time_channel
+    timestamp_format = "unknown"
+    if time_col is not None:
+        timestamp_samples = df[time_col].head(10).astype(str).tolist()
+        timestamp_format = detect_timestamp_format(timestamp_samples)
+
+    anchor = None
+    if assignment.time_kind == "elapsed_seconds":
+        anchor = extract_time_anchor(preamble_meta)
+
+    if assignment.setpoint_channel is None:
+        audit_log.add(AuditEntry(
+            timestamp=datetime.now(),
+            module_name="file_loader",
+            action="no_setpoint_channel",
+            decision="WARNING",
+            reason="No setpoint channel detected - will use Mode B inference",
+            severity=AuditSeverity.WARNING,
+            category=AuditCategory.QUALITY,
+        ))
+
     raw_data = df.to_dict(orient="records")
-    
+
     raw_trace = RawTraceData(
         columns=columns,
         data=raw_data,
         row_count=len(df),
     )
-    
+
+    temp_col = assignment.temperature_channel
+    sp_col = assignment.setpoint_channel
     auxiliary_count = len([c for c in columns if c not in (time_col, temp_col, sp_col)])
-    
+
     file_metadata = FileMetadata(
         source_file_path=str(path.absolute()),
-        detected_delimiter=successful_strategy["sep"],
-        detected_header_rows=1,
-        header_row_index=preamble_rows,
-        detected_preamble_line_count=preamble_rows,
-        detected_encoding=successful_strategy["encoding"],
+        detected_delimiter=table.delimiter,
+        detected_header_rows=0 if table.headerless else 1,
+        header_row_index=max(table.header_row_index, 0),
+        detected_preamble_line_count=len(table.preamble_lines),
+        detected_encoding=table.encoding,
         detected_timestamp_format=timestamp_format,
-        detected_temperature_unit=temp_unit,
+        detected_temperature_unit=detect_temperature_unit(temp_col),
         available_channels=[c for c in columns if c != time_col],
         selected_temperature_channel=temp_col,
         selected_setpoint_channel=sp_col,
         raw_row_count=len(df),
         usable_row_count=len(df),
         auxiliary_channel_count=auxiliary_count,
+        selected_time_channel=time_col,
+        selected_time_channel_pair=assignment.time_channel_pair,
+        time_kind=assignment.time_kind,
+        time_anchor=anchor,
+        sheet_name=table.sheet_name,
+        preamble_metadata=preamble_meta,
+        assignment_evidence=assignment.evidence,
+        assignment_warnings=assignment.warnings,
     )
-    
+
+    for warning in assignment.warnings:
+        audit_log.add(AuditEntry(
+            timestamp=datetime.now(),
+            module_name="file_loader",
+            action="channel_assignment_warning",
+            decision="WARNING",
+            reason=warning,
+            severity=AuditSeverity.WARNING,
+            category=AuditCategory.QUALITY,
+        ))
+
     audit_log.add(AuditEntry(
         timestamp=datetime.now(),
         module_name="file_loader",
@@ -207,12 +192,18 @@ def load_trace_file(
         input_reference=str(path.absolute()),
         output_reference=f"RawTraceData({len(df)} rows)",
         decision="SUCCESS",
-        reason=f"Loaded using {successful_strategy['name']}, skipped {preamble_rows} preamble rows",
+        reason=(
+            f"Structured read ({table.delimiter!r} delimited, {table.encoding}, "
+            f"{len(table.preamble_lines)} preamble lines"
+            + (f", sheet '{table.sheet_name}'" if table.sheet_name else "")
+            + "); "
+            + "; ".join(assignment.evidence)
+        ),
         rows_used=len(df),
         severity=AuditSeverity.INFO,
         category=AuditCategory.PIPELINE,
     ))
-    
+
     return raw_trace, file_metadata
 
 

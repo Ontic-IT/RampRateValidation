@@ -194,6 +194,19 @@ class CanonicalTrace(BaseModel):
     rows: list[CanonicalTraceRow] = Field(default_factory=list)
 
 
+class IngestValidityReport(BaseModel):
+    """Verdict of the ingest validity gate — is this trace a ramp test at all?"""
+    verdict: str = "VALID"  # VALID | FLAGGED | INVALID
+    flags: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)  # informational, no verdict impact
+    row_count: int = 0
+    duration_seconds: float = 0.0
+    commanded_excursion_c: float | None = None  # setpoint span; None if no setpoint
+    observed_excursion_c: float = 0.0
+    median_interval_seconds: float = 0.0
+    irregular_interval_fraction: float = 0.0
+
+
 class RawTraceData(BaseModel):
     """Raw trace data preserving ALL columns from source file."""
     columns: list[str] = Field(default_factory=list)
@@ -389,6 +402,14 @@ class RampMetrics(BaseModel):
     monotonicity_score: float = 0.0
     slope_calculation_method: str = "theil_sen"
     sustained_window_seconds_used: float = 60.0
+    # What the setpoint programme COMMANDED over this ramp's own window
+    # (°C/min); None when the setpoint was flat, stepped, or absent there —
+    # such ramps have no commanded rate to validate against.
+    commanded_slope_c_per_min: float | None = None
+    # Theil-Sen slope confidence-interval half-width (°C/min): how precisely
+    # this ramp's rate is even measurable. Floors the ramp-rate band so it is
+    # never tighter than measurement precision.
+    slope_uncertainty_c_per_min: float = 0.0
 
 
 class DwellMetrics(BaseModel):
@@ -403,6 +424,9 @@ class DwellMetrics(BaseModel):
     time_inside_tolerance_band_pct: float = 0.0
     overshoot_magnitude_c: float | None = None
     overshoot_duration_seconds: float | None = None
+    # Time from the first excursion beyond the setpoint tolerance until the
+    # temperature first returns within tolerance (the overshoot recovery time).
+    overshoot_recovery_seconds: float | None = None
     settling_time_seconds: float | None = None
     oscillation_count: int = 0
     stability_score: float | None = None
@@ -571,6 +595,15 @@ class FileMetadata(BaseModel):
     raw_row_count: int = 0
     usable_row_count: int = 0
     auxiliary_channel_count: int = 0  # Number of auxiliary channels detected
+    # --- Adaptive normalisation (additive; defaults preserve old behaviour) ---
+    selected_time_channel: str | None = None
+    selected_time_channel_pair: list[str] = Field(default_factory=list)
+    time_kind: str = ""  # datetime|datetime_pair|datetime_objects|excel_serial|epoch_seconds|elapsed_seconds
+    time_anchor: datetime | None = None
+    sheet_name: str | None = None
+    preamble_metadata: dict[str, str] = Field(default_factory=dict)
+    assignment_evidence: list[str] = Field(default_factory=list)
+    assignment_warnings: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +613,7 @@ class FileMetadata(BaseModel):
 class AnalysisRequest(BaseModel):
     """Input request for pipeline execution."""
     file_path: str
-    profile_path: str
+    profile_path: str | None = None  # None = self-validation (trace-derived requirements)
     output_dir: str = "."
     channel: str | None = None
     setpoint_channel: str | None = None
@@ -641,6 +674,8 @@ class AnalysisContext(BaseModel):
     # Pipeline state tracking
     pipeline_stages: list[PipelineStageState] = Field(default_factory=list)
     quality_blocked: bool = False
+    ingest_validity: IngestValidityReport | None = None
+    ingest_blocked: bool = False
     
     # Adaptive constants (derived from preprocessing)
     adaptive_constants: Any = None
@@ -694,6 +729,7 @@ class AnalysisResult(BaseModel):
     status: OverallValidationStatus
     status_reason: str = ""
     canonical_trace: CanonicalTrace | None = None
+    ingest_validity: IngestValidityReport | None = None
     data_quality_report: RunDataQualityReport | None = None
     validation_profile_used: Any = None  # ValidationProfile
     inferred_setpoints: ResolvedSetpoints | None = None

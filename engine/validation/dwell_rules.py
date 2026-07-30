@@ -81,8 +81,11 @@ def validate_dwell_duration(
         result = ValidationStatus.PASS
         reason = f"Duration {duration:.1f}s within {sigma_threshold}σ of median {median_duration_seconds:.1f}s (deviation: {deviation_from_median:.1f}s <= {max_allowed_deviation:.1f}s)"
     else:
-        result = ValidationStatus.FAIL
-        reason = f"Duration {duration:.1f}s exceeds {sigma_threshold}σ from median {median_duration_seconds:.1f}s (deviation: {deviation_from_median:.1f}s > {max_allowed_deviation:.1f}s)"
+        # A statistically unusual duration is an ANOMALY to surface, not a
+        # compliance failure — duration outliers say nothing about whether
+        # the chamber held its setpoint.
+        result = ValidationStatus.PASS_WITH_WARNINGS
+        reason = f"Anomalous duration: {duration:.1f}s deviates >{sigma_threshold}σ from median {median_duration_seconds:.1f}s (deviation: {deviation_from_median:.1f}s > {max_allowed_deviation:.1f}s) — flagged for review"
     
     validation_result = ValidationResult(
         validation_result_id=str(uuid.uuid4()),

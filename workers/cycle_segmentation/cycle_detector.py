@@ -84,8 +84,23 @@ def detect_cycles(
         end_time = cycle_regions[-1].end_time
         duration = (end_time - start_time).total_seconds()
         
-        heating_ramps = [r for r in cycle_ramps if r.direction.value == "HEATING"]
-        cooling_ramps = [r for r in cycle_ramps if r.direction.value == "COOLING"]
+        # Count only SUBSTANTIAL ramps — those traversing a meaningful part of
+        # the hot-cold span. On noisy traces the return-to-ambient can shatter
+        # into many cooling slivers; those are not separate ramps and must not
+        # inflate the per-cycle count (which should be ~1 heating + 1 cooling).
+        span_full = abs(
+            (setpoints.inferred_hot_setpoint_c or 0.0)
+            - (setpoints.inferred_cold_setpoint_c or 0.0)
+        )
+        min_ramp_span = span_full * 0.3 if span_full > 0 else 0.0
+        heating_ramps = [
+            r for r in cycle_ramps
+            if r.direction.value == "HEATING" and abs(r.temperature_delta_c) >= min_ramp_span
+        ]
+        cooling_ramps = [
+            r for r in cycle_ramps
+            if r.direction.value == "COOLING" and abs(r.temperature_delta_c) >= min_ramp_span
+        ]
         
         cycle = Cycle(
             cycle_id=f"C{i:04d}",
@@ -142,49 +157,76 @@ def _find_cycle_boundaries(
     regions: list[Region],
     setpoints: ResolvedSetpoints,
 ) -> list[tuple[int, int]]:
-    """Find cycle boundaries by tracking complete thermal excursions.
-    
-    Domain knowledge: Traces ALWAYS start on COLD ramp down first.
-    
-    A complete cycle = HOT ramp → HOT dwell → COLD ramp → COLD dwell
-    - COLD dwell ends the current cycle
-    - Next HOT dwell starts a new cycle
-    - Consecutive HOT_DWELL regions without COLD_DWELL are part of the SAME cycle
-    
-    Pattern: [initial COLD] → [HOT→COLD cycle 1] → [HOT→COLD cycle 2] → ...
+    """Find cycle boundaries.
+
+    A cycle is one complete thermal excursion away from ambient and back:
+    it contains ONE heating ramp and ONE cooling ramp (with their dwells),
+    in EITHER order — the tool must not assume heat-first or cold-first,
+    because different tests run them in different orders.
+
+    A new cycle begins when a ramp direction REPEATS: once the current cycle
+    has both a heating and a cooling ramp, the next ramp of an
+    already-seen direction is the start of the next excursion. Leading and
+    trailing non-ramp regions (the ambient soak at the start and the
+    return-to-ambient at the end) attach to the first and last cycle. So the
+    heating ramp is always inside its cycle — which is why it is now counted.
     """
     if not regions:
         return []
-    
-    boundaries = []
-    current_start = 0
-    in_cycle = False  # Track if we're currently in a HOT→COLD cycle
-    
+
+    n = len(regions)
+
+    # Anchor on SUBSTANTIAL DWELLS, not ramps. Dwells (one hot, one cold per
+    # cycle) are cleanly classified even when ramps fragment into slivers, so
+    # counting cycles by dwells is robust. But a noisy start can leave tiny
+    # dwell fragments (a 0-1 min "dwell" next to an overshoot); those are not
+    # real soaks and must not each spawn a cycle. So only dwells lasting a
+    # meaningful fraction of the typical soak count as cycle anchors.
+    dwell_durations = [
+        r.duration_seconds for r in regions
+        if r.primary_classification in (RegionType.HOT_DWELL, RegionType.COLD_DWELL)
+    ]
+    min_dwell_seconds = (float(np.median(dwell_durations)) * 0.2) if dwell_durations else 0.0
+
+    # A new cycle begins once the current one has both a hot and a cold dwell
+    # and the next dwell of an already-seen type appears; the cut is placed at
+    # the ramp that starts that next excursion (right after the previous dwell).
+    cuts = [0]
+    seen: set[str] = set()
+    prev_dwell_idx = -1
     for i, region in enumerate(regions):
-        region_type = region.primary_classification
-        
-        # HOT dwell starts a new cycle (if not already in one)
-        if region_type == RegionType.HOT_DWELL:
-            if not in_cycle:
-                # Start new cycle at this HOT dwell
-                current_start = i
-                in_cycle = True
-        
-        # COLD dwell ends the current cycle (if we're in one)
-        elif region_type == RegionType.COLD_DWELL:
-            if in_cycle:
-                # End current cycle at this COLD dwell
-                boundaries.append((current_start, i))
-                in_cycle = False
-    
-    # Add final incomplete cycle if we're still in one
-    if in_cycle and current_start < len(regions):
-        boundaries.append((current_start, len(regions) - 1))
-    
-    # Fallback: if no boundaries found, treat entire trace as one cycle
-    if not boundaries and regions:
-        boundaries = [(0, len(regions) - 1)]
-    
+        rt = region.primary_classification
+        kind = (
+            "H" if rt == RegionType.HOT_DWELL
+            else "C" if rt == RegionType.COLD_DWELL
+            else None
+        )
+        if kind is None or region.duration_seconds < min_dwell_seconds:
+            continue
+        if kind in seen:
+            cut = prev_dwell_idx + 1
+            if cut > cuts[-1]:
+                cuts.append(cut)
+            seen = {kind}
+        else:
+            seen.add(kind)
+        prev_dwell_idx = i
+
+    boundaries = [
+        (cuts[k], (cuts[k + 1] - 1) if k + 1 < len(cuts) else n - 1)
+        for k in range(len(cuts))
+    ]
+
+    # A trailing group that does not itself contain BOTH ramp directions is
+    # the return-to-ambient tail of the previous cycle — merge it back.
+    if len(boundaries) >= 2:
+        s, e = boundaries[-1]
+        types = {regions[j].primary_classification for j in range(s, e + 1)}
+        if not (RegionType.HEATING_RAMP in types and RegionType.COOLING_RAMP in types):
+            ps, _ = boundaries[-2]
+            boundaries[-2] = (ps, e)
+            boundaries.pop()
+
     return boundaries
 
 

@@ -67,7 +67,8 @@ def compute_ramp_metrics(
     ])
     
     robust_slope = _compute_theil_sen_slope(temperatures, elapsed)
-    
+    slope_uncertainty = _compute_slope_uncertainty(temperatures, elapsed)
+
     sample_interval = rows[0].sample_interval_seconds if rows else 1.0
     min_sustained = _compute_minimum_sustained_slope(
         temperatures, elapsed, sustained_ramp_window_seconds, sample_interval
@@ -84,7 +85,9 @@ def compute_ramp_metrics(
     taper_score = _compute_taper_score(rolling_slopes)
     
     linearity_score = _compute_linearity_score(temperatures, elapsed, robust_slope)
-    
+
+    commanded_slope = _compute_commanded_slope(rows, elapsed)
+
     metrics = RampMetrics(
         region_id=valid_ramp.region_id,
         robust_slope_c_per_min=robust_slope,
@@ -100,6 +103,8 @@ def compute_ramp_metrics(
         monotonicity_score=valid_ramp.monotonicity_score,
         slope_calculation_method="theil_sen",
         sustained_window_seconds_used=sustained_ramp_window_seconds,
+        commanded_slope_c_per_min=commanded_slope,
+        slope_uncertainty_c_per_min=slope_uncertainty,
     )
     
     audit_log.add(AuditEntry(
@@ -118,21 +123,78 @@ def compute_ramp_metrics(
     return metrics
 
 
+def _compute_commanded_slope(rows: list, elapsed: np.ndarray) -> float | None:
+    """The setpoint programme's slope over THIS ramp's own window (°C/min).
+
+    This is the ramp's specification: what the chamber was told to do right
+    here. Returns None when there is no commanded rate to hold the ramp to —
+    setpoint absent, flat (uncontrolled drift / return-to-ambient), or
+    stepped (an instantaneous command has no slope).
+    """
+    sp = np.array(
+        [r.setpoint_c if r.setpoint_c is not None else np.nan for r in rows],
+        dtype=float,
+    )
+    valid = ~np.isnan(sp)
+    if valid.sum() < max(3, len(rows) // 2):
+        return None
+
+    sp_v, t_v = sp[valid], elapsed[valid]
+    span = float(np.nanmax(sp_v) - np.nanmin(sp_v))
+    duration_s = float(t_v[-1] - t_v[0])
+    if span < 2.0 or duration_s <= 0:
+        return None  # setpoint effectively flat here: nothing was commanded
+
+    # Slope of the command over the window. If the setpoint moved in fewer
+    # than 3 samples it was a step, not a ramp command.
+    moving_samples = int((np.abs(np.diff(sp_v)) > 1e-9).sum())
+    if moving_samples < 3:
+        return None
+
+    result = stats.theilslopes(sp_v, t_v)
+    commanded = float(result.slope * 60.0)
+    if abs(commanded) < 0.1:
+        return None
+    return abs(commanded)
+
+
 def _compute_theil_sen_slope(
     temperatures: np.ndarray,
     elapsed: np.ndarray,
 ) -> float:
     """Compute Theil-Sen robust slope estimate.
-    
+
     PRIMARY compliance metric per plan specification.
     """
     if len(temperatures) < 2:
         return 0.0
-    
+
     result = stats.theilslopes(temperatures, elapsed)
     slope_per_second = result.slope
-    
+
     return float(slope_per_second * 60.0)
+
+
+def _compute_slope_uncertainty(
+    temperatures: np.ndarray,
+    elapsed: np.ndarray,
+) -> float:
+    """Theil-Sen slope 95% CI half-width in °C/min.
+
+    How precisely this ramp's rate is measurable given its own scatter. Used
+    to floor the ramp-rate band: two rates cannot be distinguished more
+    finely than each is measured, so the band must not be tighter than this.
+    """
+    if len(temperatures) < 3:
+        return 0.0
+    try:
+        result = stats.theilslopes(temperatures, elapsed)
+        half_width_per_s = (result.high_slope - result.low_slope) / 2.0
+        if not np.isfinite(half_width_per_s):
+            return 0.0
+        return float(abs(half_width_per_s) * 60.0)
+    except (ValueError, FloatingPointError):
+        return 0.0
 
 
 def _compute_minimum_sustained_slope(

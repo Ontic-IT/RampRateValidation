@@ -67,6 +67,136 @@ from engine.validation.tolerance_resolver import (
 )
 
 
+def _derive_direction_band(
+    direction,
+    valid_ramps: list,
+    ramp_metrics_map: dict,
+    explicit_rate: float | None,
+    audit_log: AuditLog,
+) -> tuple[float | None, float | None]:
+    """Per-direction band centre (target) and tolerance half-width.
+
+    Computed SEPARATELY for heating and cooling — they are different physical
+    processes (resistive heating vs refrigeration) and hold their rates to
+    different consistencies, so each gets its own band.
+
+    Band centre (target): explicit profile rate → median commanded setpoint
+    slope (Mode A) → median measured rate (stepped/Mode B, self-referential).
+
+    Band half-width is derived ENTIRELY from the trace's own evidence — no
+    picked fraction, no floor:
+
+        tolerance = systematic_lag + K * MAD(measured rates)
+
+    where
+      - MAD(measured rates) is the robust spread of this direction's per-ramp
+        rates: the chamber's DEMONSTRATED rate-holding consistency. A chamber
+        that holds its rate tightly earns a tight band; an erratic one a
+        looser band. This self-scales, exactly as intended.
+      - systematic_lag = |median(measured) - target| absorbs the steady
+        commanded-vs-achieved offset (thermal mass makes a chamber track its
+        commanded ramp with a small consistent lag), so the symmetric band
+        around the commanded rate does not reject ramps for that normal lag.
+      - K = 3 x 1.4826 is the standard robust 3-sigma-equivalent scaling
+        (MAD->sigma is 1.4826; 3 sigma is the conventional outlier bound). It
+        is a fixed statistical convention, not a tuning knob.
+
+    A ramp fails when its rate is a robust >3-sigma outlier relative to the
+    chamber's own demonstrated ramp behaviour — two-sided, so too-fast fails
+    as readily as too-slow.
+    """
+    import numpy as np
+
+    MAD_TO_SIGMA = 1.4826
+    SIGMA_BOUND = 3.0
+    K = SIGMA_BOUND * MAD_TO_SIGMA
+
+    metrics = [
+        ramp_metrics_map[vr.region_id]
+        for vr in valid_ramps
+        if vr.direction == direction and vr.region_id in ramp_metrics_map
+    ]
+    if not metrics:
+        return None, None
+
+    measured = np.array([abs(m.robust_slope_c_per_min) for m in metrics])
+    commanded = np.array([
+        abs(m.commanded_slope_c_per_min) for m in metrics
+        if m.commanded_slope_c_per_min is not None
+    ])
+
+    if explicit_rate is not None:
+        target = abs(explicit_rate)
+        source = "explicit profile rate"
+    elif commanded.size:
+        target = float(np.median(commanded))
+        source = "median commanded setpoint slope"
+    elif measured.size:
+        target = float(np.median(measured))
+        source = "median measured rate (no commanded rate; self-referential)"
+    else:
+        return None, None
+
+    median_measured = float(np.median(measured))
+    mad = float(np.median(np.abs(measured - median_measured)))  # chamber's own consistency
+    systematic_lag = abs(median_measured - target)
+
+    # Cross-ramp spread (the chamber's demonstrated consistency), floored at
+    # the measurement precision of a single ramp. With few, tightly-clustered
+    # ramps the sample MAD collapses toward zero and would flag a sibling
+    # differing by a hair (e.g. 4.968 vs 4.972); the band must never be
+    # tighter than how precisely a rate is even measurable. Both terms are
+    # trace-derived — no picked constant.
+    measurement_precision = float(np.median([
+        m.slope_uncertainty_c_per_min for m in metrics
+        if m.slope_uncertainty_c_per_min > 0
+    ] or [0.0]))
+    spread = max(K * mad, measurement_precision)
+    tolerance = systematic_lag + spread
+
+    dir_name = direction.value if hasattr(direction, "value") else str(direction)
+    audit_log.add(AuditEntry(
+        timestamp=datetime.now(),
+        module_name="validation_engine",
+        action="ramp_band_derived",
+        input_reference=dir_name,
+        decision="DERIVED",
+        reason=(
+            f"{dir_name} ramp band {target:.2f} +/- {tolerance:.3f} degC/min "
+            f"(centre from {source}; half-width = lag {systematic_lag:.3f} + "
+            f"spread {spread:.3f} = max(3-sigma MAD {K * mad:.3f} [MAD {mad:.3f} "
+            f"over {measured.size} ramp(s)], measurement precision "
+            f"{measurement_precision:.3f}); fully trace-derived, no picked constant)"
+        ),
+        thresholds_used={
+            "target": target, "tolerance": tolerance, "mad": mad,
+            "lag": systematic_lag, "measurement_precision": measurement_precision,
+        },
+        severity=AuditSeverity.INFO,
+        category=AuditCategory.VALIDATION,
+    ))
+    return target, tolerance
+
+
+def _note_descriptive_ramp(valid_ramp, metrics, audit_log: AuditLog) -> None:
+    """Record a ramp that has no rate spec to validate against (descriptive)."""
+    dir_name = valid_ramp.direction.value if hasattr(valid_ramp.direction, "value") else str(valid_ramp.direction)
+    audit_log.add(AuditEntry(
+        timestamp=datetime.now(),
+        module_name="validation_engine",
+        action="ramp_descriptive_only",
+        input_reference=valid_ramp.region_id,
+        decision="NO_TARGET_RATE",
+        reason=(
+            f"{dir_name} ramp {valid_ramp.region_id}: no commanded or reference "
+            f"rate available (measured {metrics.robust_slope_c_per_min:.2f} "
+            "degC/min reported descriptively)"
+        ),
+        severity=AuditSeverity.INFO,
+        category=AuditCategory.VALIDATION,
+    ))
+
+
 def validate_analysis(
     profile: ValidationProfile,
     regions: RegionList,
@@ -97,48 +227,105 @@ def validate_analysis(
     if audit_log is None:
         audit_log = AuditLog()
 
-    # Resolve tolerance-bearing parameters before any rule runs
-    tolerance_parameters = ["dwell_setpoint_deviation", "ramp_deviation"]
+    # Resolve tolerance-bearing parameters before any rule runs.
+    # Explicit profile value wins; otherwise the trace-derived value is used
+    # (self-referential validation: the setpoint programme is the spec).
+    # Ramp RATE targets are NOT resolved here — they are handled as a
+    # per-direction BAND (centre + tolerance) derived directly from each
+    # direction's commanded/measured rates in _derive_direction_band.
+    tolerance_parameters = [
+        "dwell_setpoint_deviation",
+        "ramp_deviation",
+    ]
     for param in tolerance_parameters:
-        resolution = resolve_tolerance(param, profile, adaptive_constants, audit_log)
-        profile.tolerance_resolutions.append(resolution)
+        try:
+            resolution = resolve_tolerance(param, profile, adaptive_constants, audit_log)
+            profile.tolerance_resolutions.append(resolution)
+        except ValueError:
+            # Neither explicit nor derivable (e.g. step-setpoint programme
+            # has no commanded ramp rate) — that requirement is descriptive.
+            audit_log.add(AuditEntry(
+                timestamp=datetime.now(),
+                module_name="validation_engine",
+                action="tolerance_unresolvable",
+                input_reference=param,
+                decision="DESCRIPTIVE_ONLY",
+                reason=(
+                    f"No explicit profile value and no trace-derived value for "
+                    f"'{param}'; measured values will be reported without pass/fail"
+                ),
+                severity=AuditSeverity.WARNING,
+                category=AuditCategory.VALIDATION,
+            ))
+
+    # Explicit ramp-rate band centres from the profile (override the derived
+    # commanded rate when a formal spec exists).
+    explicit_heating = profile.get_explicit_tolerance("required_heating_ramp_rate")
+    explicit_cooling = profile.get_explicit_tolerance("required_cooling_ramp_rate")
 
     results = []
-    
+
     ramp_metrics_map = {m.region_id: m for m in ramp_metrics}
     dwell_metrics_map = {m.region_id: m for m in dwell_metrics}
-    
+
+    # Per-direction band centre (target) and tolerance, derived once from the
+    # trace so heating and cooling each get their OWN band (they are different
+    # physical processes and may run at different rates).
+    heating_target, heating_tol = _derive_direction_band(
+        RampDirection.HEATING, valid_ramps, ramp_metrics_map, explicit_heating, audit_log
+    )
+    cooling_target, cooling_tol = _derive_direction_band(
+        RampDirection.COOLING, valid_ramps, ramp_metrics_map, explicit_cooling, audit_log
+    )
+
     for valid_ramp in valid_ramps:
         metrics = ramp_metrics_map.get(valid_ramp.region_id)
         if not metrics:
             continue
-        
+
         if quality_impact:
             quality_status, quality_reason = validate_data_quality(
                 quality_impact, "HEATING_RAMP_RATE"
             )
             if quality_status.value == "INCONCLUSIVE":
                 continue
-        
+
+        # Band centre: the ramp's OWN commanded setpoint slope when available
+        # (most specific target), else the per-direction target. Tolerance is
+        # the per-direction adaptive band half-width.
         if valid_ramp.direction == RampDirection.HEATING:
-            result = validate_heating_ramp_rate(
-                valid_ramp,
-                metrics,
-                required_rate_c_per_min=profile.ramp_rate_requirements.required_heating_ramp_rate_c_per_min,
-                minimum_sustained_ratio=profile.ramp_rate_requirements.minimum_sustained_ramp_rate_ratio,
-                audit_log=audit_log,
+            centre = (
+                abs(metrics.commanded_slope_c_per_min)
+                if metrics.commanded_slope_c_per_min is not None
+                else heating_target
             )
-            results.append(result)
-        
+            if centre is not None and heating_tol is not None:
+                results.append(validate_heating_ramp_rate(
+                    valid_ramp,
+                    metrics,
+                    required_rate_c_per_min=centre,
+                    tolerance_c_per_min=heating_tol,
+                    audit_log=audit_log,
+                ))
+            else:
+                _note_descriptive_ramp(valid_ramp, metrics, audit_log)
+
         elif valid_ramp.direction == RampDirection.COOLING:
-            result = validate_cooling_ramp_rate(
-                valid_ramp,
-                metrics,
-                required_rate_c_per_min=profile.ramp_rate_requirements.required_cooling_ramp_rate_c_per_min,
-                minimum_sustained_ratio=profile.ramp_rate_requirements.minimum_sustained_ramp_rate_ratio,
-                audit_log=audit_log,
+            centre = (
+                abs(metrics.commanded_slope_c_per_min)
+                if metrics.commanded_slope_c_per_min is not None
+                else cooling_target
             )
-            results.append(result)
+            if centre is not None and cooling_tol is not None:
+                results.append(validate_cooling_ramp_rate(
+                    valid_ramp,
+                    metrics,
+                    required_rate_c_per_min=centre,
+                    tolerance_c_per_min=cooling_tol,
+                    audit_log=audit_log,
+                ))
+            else:
+                _note_descriptive_ramp(valid_ramp, metrics, audit_log)
     
     # DWELL validation: duration and setpoint deviation (for conformance)
     # Get resolved setpoint deviation tolerance (adaptive or explicit)
